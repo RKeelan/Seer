@@ -1,0 +1,2 @@
+# Check text files out with LF on every platform, so rustfmt's output and the repository agree.
+* text=auto eol=lf

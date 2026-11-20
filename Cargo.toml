@@ -1,0 +1,11 @@
+[package]
+name = "seer"
+version = "0.1.0"
+edition = "2024"
+authors = ["Richard Keelan"]
+description = "A fast, single-window image viewer for Windows that agents can drive"
+repository = "https://github.com/RKeelan/Seer"
+license = "MIT"
+publish = false
+
+[dependencies]
