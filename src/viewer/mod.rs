@@ -7,22 +7,37 @@
 //! - [`timing`]: start-up timing.
 //! - [`log`]: the log file and panic hook.
 //!
+//! The viewer is the [`App`] state machine wired to Win32. The window
+//! procedure turns messages into [`Input`]; the pipe server's requests and
+//! the decode worker's results arrive as [`Input`] too, posted to the UI
+//! thread, which never blocks on a pipe. The viewer carries out the
+//! [`Effect`]s `App` returns and draws [`App::scene`].
+//!
+//! The first viewer on an instance takes the instance's mutex. A later one
+//! finds the mutex taken, hands its files to the first over the pipe, asking
+//! it to come to the foreground, and exits.
+//!
 //! Start-up is arranged so the first frame appears as soon as possible:
 //!
-//! - The decode worker starts before the window exists, decoding the image at
-//!   the size it will be shown.
+//! - The decode worker starts before the window exists, decoding the first
+//!   image at the size it will be shown.
 //! - Meanwhile the main thread creates the window and a WARP device, which
 //!   takes a few milliseconds, then starts another thread creating the
 //!   hardware Direct3D device, which means loading the graphics driver and can
 //!   take longer than everything else together.
 //! - The main thread draws the first frame on WARP while the window is still
 //!   hidden, and then shows the window, so it never appears blank.
+//! - Only then does the pipe server start.
 //! - When the hardware device is ready, the frame is drawn there and replaces
 //!   WARP's in one composition commit. The full-resolution decode follows on
 //!   the worker and replaces the preview.
 //!
-//! A headless viewer stays on WARP, so it draws the same pixels on every
-//! machine.
+//! A viewer started with no files, as `seer open` starts one before sending
+//! the files over the pipe, stays hidden until the first image it is sent has
+//! been drawn, or until [`EMPTY_SHOW_DELAY_MS`] passes with nothing to show.
+//!
+//! A headless viewer never shows its window and stays on WARP, so it draws
+//! the same pixels on every machine.
 
 pub mod args;
 pub mod log;
@@ -31,16 +46,18 @@ pub mod timing;
 pub mod watch;
 pub mod window;
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
@@ -48,26 +65,41 @@ use windows::Win32::System::Console::{
 
 use self::args::{RunArgs, ViewerArgs};
 use self::timing::Timings;
-use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, Window};
+use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, WM_REQUEST, Window};
 use crate::decode::wic::Decoded;
 use crate::decode::worker::{Job, Output, Worker};
-use crate::error::{Error, Result};
-use crate::ipc::instance::InstanceName;
+use crate::error::{Error, ErrorCode, Result};
+use crate::ipc::client;
+use crate::ipc::instance::{InstanceMutex, InstanceName};
+use crate::ipc::server::{self, Responder, Server};
 use crate::model::ImageId;
-use crate::model::app::DecodeTarget;
-use crate::model::geometry::{PixelSize, Rect, Transform};
+use crate::model::app::{App, Config, Cursor, DecodeTarget, Effect, Input, RequestId};
+use crate::model::geometry::PixelSize;
+use crate::model::set::DiskFiles;
+use crate::protocol::{OpenFile, Reply, Request, Response};
 use crate::render::device::{Composition, Device, SwapChain, hardware_device};
 use crate::render::draw::{Bitmaps, Renderer};
-use crate::render::scene::{Align, Colour, Interpolation, Item, Scene};
+use crate::render::offscreen;
+use crate::render::scene::Scene;
 
-/// The colour behind the image.
-const BACKGROUND: Colour = Colour::rgb(32, 32, 32);
+/// The id of the request the viewer makes of itself to open the files on its
+/// command line. The pipe server numbers its requests from 1.
+const COMMAND_LINE: RequestId = RequestId(0);
 
-/// The colour of messages drawn in the window.
-const MESSAGE: Colour = Colour::rgb(220, 220, 220);
+/// The timer behind [`Effect::WakeAfter`].
+const WAKE_TIMER: usize = 1;
 
-/// The one image shown.
-const IMAGE: ImageId = ImageId(1);
+/// The timer that shows a window started with no files that has been sent
+/// nothing to show.
+const SHOW_TIMER: usize = 2;
+
+/// How long a viewer started with no files waits for an image before showing
+/// its window empty.
+pub const EMPTY_SHOW_DELAY_MS: u64 = 1000;
+
+/// How long a viewer that is exiting waits for its last replies to reach
+/// their clients.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The entry point of `seerw.exe`.
 pub fn main() -> ExitCode {
@@ -97,30 +129,68 @@ where
     }
 }
 
-/// Opens the window on the first file, and runs until it is closed. Returns
-/// the exit code.
+/// Whether this process owns the instance or handed its files to the one that
+/// does.
+enum Ownership {
+    Owner(InstanceMutex),
+    /// The files went to the running viewer; this is the exit code.
+    HandedOff(u8),
+}
+
+/// Opens the window on the files, and runs until it is closed or told to
+/// quit. Returns the exit code.
 fn start(args: &RunArgs) -> Result<u8> {
     let mut timings = Timings::start();
     timings.mark("main");
-    InstanceName::from_environment(args.instance.as_deref())?;
-    let placement = window::default_placement();
-    let client = PixelSize::new(placement.width, placement.height);
+    let instance = InstanceName::from_environment(args.instance.as_deref())?;
+    let files = args
+        .files
+        .iter()
+        .map(|path| std::path::absolute(path).map_err(Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    let _mutex = match take_instance(&instance, &files)? {
+        Ownership::Owner(mutex) => mutex,
+        Ownership::HandedOff(code) => return Ok(code),
+    };
 
+    let placement = window::default_placement();
     let hwnd = Arc::new(AtomicIsize::new(0));
     let worker = {
         let hwnd = Arc::clone(&hwnd);
         Worker::spawn(move || window::post(hwnd.load(Ordering::Acquire), WM_DECODED))
     };
-    let file = args.files.first();
-    if let Some(path) = file {
-        worker.submit(Job {
-            image: IMAGE,
-            path: path.clone(),
-            target: DecodeTarget::Fit { within: client },
-        });
+    let config = Config {
+        headless: args.headless,
+        size: PixelSize::new(placement.width, placement.height),
+        dpi: window::system_dpi(),
+        dark: true,
+    };
+    let mut app = App::new(config, Box::new(DiskFiles), Instant::now());
+    // The decodes start at once; everything else waits for the window.
+    let mut early = Vec::new();
+    if !files.is_empty() {
+        let request = open_request(&files, !args.no_activate);
+        let input = Input::Request {
+            id: COMMAND_LINE,
+            request,
+        };
+        for effect in app.handle(input, Instant::now()) {
+            match effect {
+                Effect::Decode {
+                    image,
+                    path,
+                    target,
+                } => worker.submit(Job {
+                    image,
+                    path,
+                    target,
+                }),
+                other => early.push(other),
+            }
+        }
     }
 
-    let window = Window::create(placement, &title(file.map(AsRef::as_ref)))?;
+    let window = Window::create(placement, &app.title())?;
     hwnd.store(window.hwnd().0 as isize, Ordering::Release);
     timings.mark("window_created");
     let composition = Composition::new(window.hwnd())?;
@@ -131,58 +201,155 @@ fn start(args: &RunArgs) -> Result<u8> {
     // driver takes long to load, is started only once WARP's is made.
     let upgrade = (!args.headless).then(|| Upgrade::spawn(Arc::clone(&hwnd)));
 
-    let mut viewer = Viewer {
-        device,
-        swap_chain,
-        composition,
-        renderer: Renderer::default(),
-        bitmaps: Bitmaps::new(),
-        path: file.cloned(),
-        image: None,
-        pixels: None,
-        error: None,
+    let (events, received) = mpsc::channel();
+    let mut viewer = Viewer::new(
+        window.hwnd(),
+        app,
+        Graphics {
+            device,
+            swap_chain,
+            composition,
+        },
         worker,
         upgrade,
         timings,
-    };
-    if let Some(output) = file.and_then(|_| viewer.worker.recv()) {
+        received,
+    );
+    if !args.headless {
+        viewer.visibility = Visibility::Hidden {
+            activate: !args.no_activate,
+            waited: !files.is_empty(),
+        };
+    }
+    viewer.perform(early);
+    while let Some(image) = viewer.awaited() {
+        let Some(output) = viewer.worker.recv() else {
+            break;
+        };
+        let first = output.image == image;
         viewer.accept(output);
+        if first {
+            break;
+        }
     }
     viewer.present()?;
-    viewer.composition.show(&viewer.swap_chain)?;
+    viewer
+        .graphics
+        .composition
+        .show(&viewer.graphics.swap_chain)?;
     viewer.timings.mark("first_present");
-    if !args.headless {
-        window.show(!args.no_activate);
-        viewer.timings.mark("shown");
-    }
+    viewer.show_if_ready();
 
-    let code = viewer.error.as_ref().map_or(0, Error::exit_code);
     if args.exit_after_first_frame {
         attach_parent_console();
         let report = serde_json::to_string(&viewer.timings.report())?;
         let _ = writeln!(std::io::stdout(), "{report}");
-        return Ok(code);
+        return Ok(viewer.first_error.as_ref().map_or(0, Error::exit_code));
     }
-    if args.headless {
-        // Nothing can reach a headless viewer until it serves the pipe.
-        return Ok(code);
+    if matches!(viewer.visibility, Visibility::Hidden { .. }) {
+        window::set_timer(window.hwnd(), SHOW_TIMER, EMPTY_SHOW_DELAY_MS);
     }
 
+    let server = Server::start(
+        &instance,
+        Pipe {
+            events,
+            hwnd: Arc::clone(&hwnd),
+        },
+    )?;
     window.set_handler(Box::new(viewer));
-    // Anything that finished before the window's handle was known was not
-    // announced.
-    window::post(window.hwnd().0 as isize, WM_DECODED);
-    window::post(window.hwnd().0 as isize, WM_DEVICE_READY);
+    // Anything that finished before the window's handle was known, or
+    // before the handler was in place, was not announced.
+    for message in [WM_DECODED, WM_DEVICE_READY, WM_REQUEST] {
+        window::post(window.hwnd().0 as isize, message);
+    }
     window::run_message_loop();
+    // Dropping the viewer answers any request it still holds with an error.
+    drop(window.take_handler());
+    server.stop(REPLY_TIMEOUT);
     Ok(0)
 }
 
-/// The window's title: the file's name, or the program's.
-fn title(file: Option<&Path>) -> String {
-    file.and_then(Path::file_name).map_or_else(
-        || "Seer".to_owned(),
-        |name| name.to_string_lossy().into_owned(),
-    )
+/// Takes the instance's mutex, or hands the files to the viewer that holds
+/// it.
+///
+/// A viewer that holds the mutex may not serve its pipe yet, and one that is
+/// exiting may let go of the mutex without answering, so this tries both
+/// again until one succeeds or [`client::LAUNCH_TIMEOUT`] passes.
+fn take_instance(instance: &InstanceName, files: &[PathBuf]) -> Result<Ownership> {
+    let deadline = Instant::now() + client::LAUNCH_TIMEOUT;
+    loop {
+        if let Some(mutex) = InstanceMutex::acquire(instance)? {
+            return Ok(Ownership::Owner(mutex));
+        }
+        if files.is_empty() {
+            return Ok(Ownership::HandedOff(0));
+        }
+        match hand_off(instance, files) {
+            Err(error) if error.code == ErrorCode::NoViewer && Instant::now() < deadline => {}
+            result => return result.map(Ownership::HandedOff),
+        }
+    }
+}
+
+/// Sends the files to the running viewer, letting it come to the foreground,
+/// and returns the exit code: 4 if any could not be opened.
+fn hand_off(instance: &InstanceName, files: &[PathBuf]) -> Result<u8> {
+    let reply = client::connect(instance)?.send(&open_request(files, true))?;
+    Ok(match reply {
+        Reply::Opened(opened) => opened
+            .failed
+            .first()
+            .map_or(0, |failure| failure.error.exit_code()),
+        _ => 0,
+    })
+}
+
+fn open_request(files: &[PathBuf], activate: bool) -> Request {
+    Request::Open {
+        files: files
+            .iter()
+            .map(|path| OpenFile {
+                path: path.clone(),
+                caption: None,
+            })
+            .collect(),
+        group: None,
+        compare: false,
+        activate,
+    }
+}
+
+/// What the pipe server hands the UI thread.
+enum PipeEvent {
+    Request(Request, Responder),
+    Disconnected(RequestId),
+}
+
+/// The pipe server's handler: posts each request to the UI thread.
+struct Pipe {
+    events: Sender<PipeEvent>,
+    hwnd: Arc<AtomicIsize>,
+}
+
+impl Pipe {
+    fn post(&self, event: PipeEvent) {
+        // If the viewer has gone, the event is dropped, and with it the
+        // responder, which answers with an error.
+        if self.events.send(event).is_ok() {
+            window::post(self.hwnd.load(Ordering::Acquire), WM_REQUEST);
+        }
+    }
+}
+
+impl server::Handler for Pipe {
+    fn request(&self, request: Request, responder: Responder) {
+        self.post(PipeEvent::Request(request, responder));
+    }
+
+    fn disconnected(&self, id: RequestId) {
+        self.post(PipeEvent::Disconnected(id));
+    }
 }
 
 /// A hardware Direct3D device being created on its own thread.
@@ -217,38 +384,213 @@ impl Drop for Upgrade {
     }
 }
 
-/// The shown image's state.
+/// Whether the window is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Shown {
-    /// The full size, after orientation.
-    size: PixelSize,
-    /// The size of the bitmap drawn.
-    bitmap_size: PixelSize,
+enum Visibility {
+    /// Headless: never shown.
+    Never,
+    /// Not shown yet.
+    Hidden {
+        /// Whether to activate the window when it is shown.
+        activate: bool,
+        /// Whether to show it even with nothing in the set.
+        waited: bool,
+    },
+    Shown,
 }
 
-/// Everything the window needs to draw.
-struct Viewer {
+/// What the viewer draws with.
+struct Graphics {
     device: Device,
     swap_chain: SwapChain,
     composition: Composition,
+}
+
+/// The window's handler: runs [`App`] and carries out its effects.
+struct Viewer {
+    hwnd: HWND,
+    app: App,
+    graphics: Graphics,
     renderer: Renderer,
     bitmaps: Bitmaps,
-    /// The file shown.
-    path: Option<PathBuf>,
-    image: Option<Shown>,
-    /// The shown image's pixels, kept until the move to the hardware device
-    /// so they can be uploaded there.
-    pixels: Option<Decoded>,
-    /// Why the image could not be shown.
-    error: Option<Error>,
+    /// The size of each image's bitmap in `bitmaps`.
+    bitmap_sizes: HashMap<ImageId, PixelSize>,
+    /// The decoded pixels behind `bitmaps`, kept until the move to the
+    /// hardware device so they can be uploaded there.
+    pixels: HashMap<ImageId, Decoded>,
+    /// The images whose decode failed.
+    failed: HashSet<ImageId>,
     worker: Worker,
     upgrade: Option<Upgrade>,
     timings: Timings,
+    /// Requests from the pipe server.
+    events: Receiver<PipeEvent>,
+    /// The way back to each client whose request is not answered yet.
+    responders: HashMap<RequestId, Responder>,
+    visibility: Visibility,
+    cursor: Cursor,
+    /// Whether what is shown has changed since it was last presented.
+    dirty: bool,
+    /// The first reason a file on the command line could not be shown.
+    first_error: Option<Error>,
 }
 
 impl Viewer {
-    /// Takes a decode's output: shows the bitmap if it is better than the
-    /// one shown, or the error if there is nothing to show.
+    fn new(
+        hwnd: HWND,
+        app: App,
+        graphics: Graphics,
+        worker: Worker,
+        upgrade: Option<Upgrade>,
+        timings: Timings,
+        events: Receiver<PipeEvent>,
+    ) -> Self {
+        Viewer {
+            hwnd,
+            app,
+            graphics,
+            renderer: Renderer::default(),
+            bitmaps: Bitmaps::new(),
+            bitmap_sizes: HashMap::new(),
+            pixels: HashMap::new(),
+            failed: HashSet::new(),
+            worker,
+            upgrade,
+            timings,
+            events,
+            responders: HashMap::new(),
+            visibility: Visibility::Never,
+            cursor: Cursor::Arrow,
+            dirty: false,
+            first_error: None,
+        }
+    }
+
+    /// Hands an input to the app, carries out the effects, and presents the
+    /// frame if it changed.
+    fn handle(&mut self, input: Input) {
+        let effects = self.app.handle(input, Instant::now());
+        self.perform(effects);
+    }
+
+    fn perform(&mut self, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Redraw => self.dirty = true,
+                Effect::SetTitle { title } => window::set_title(self.hwnd, &title),
+                Effect::Reply { id, response } => self.reply(id, response),
+                Effect::Screenshot { id, path } => {
+                    let response = self.screenshot(path).into();
+                    self.reply(id, response);
+                }
+                Effect::ReportTimings { id } => {
+                    let response = Response::Ok(Reply::Timings(self.timings.report()));
+                    self.reply(id, response);
+                }
+                Effect::Decode {
+                    image,
+                    path,
+                    target,
+                } => self.worker.submit(Job {
+                    image,
+                    path,
+                    target,
+                }),
+                Effect::CancelDecode { image } => {
+                    self.bitmaps.remove(&image);
+                    self.bitmap_sizes.remove(&image);
+                    self.pixels.remove(&image);
+                    self.failed.remove(&image);
+                }
+                Effect::SetCursor { cursor } => self.cursor = cursor,
+                Effect::Activate => match &mut self.visibility {
+                    Visibility::Hidden { activate, .. } => *activate = true,
+                    Visibility::Shown => window::activate(self.hwnd),
+                    Visibility::Never => {}
+                },
+                Effect::FlashTaskbar => {
+                    if self.visibility == Visibility::Shown {
+                        window::flash(self.hwnd);
+                    }
+                }
+                Effect::WakeAfter { ms } => window::set_timer(self.hwnd, WAKE_TIMER, ms),
+                Effect::Quit => window::quit(),
+                // The note field and watching files for changes are not
+                // part of the viewer yet.
+                Effect::ShowNoteField { .. }
+                | Effect::HideNoteField
+                | Effect::Watch { .. }
+                | Effect::Unwatch { .. } => {}
+            }
+        }
+    }
+
+    /// Presents the frame if it changed, and shows the window if it is ready
+    /// to be seen.
+    fn finish(&mut self) {
+        if self.dirty {
+            let _ = self.present();
+        }
+        self.show_if_ready();
+    }
+
+    fn reply(&mut self, id: RequestId, response: Response) {
+        if id == COMMAND_LINE {
+            if let Response::Ok(Reply::Opened(opened)) = &response
+                && let Some(failure) = opened.failed.first()
+            {
+                self.first_error.get_or_insert(failure.error.clone());
+            }
+        } else if let Some(responder) = self.responders.remove(&id) {
+            responder.respond(response);
+        }
+    }
+
+    /// Writes the frame as the user would see it to a PNG.
+    fn screenshot(&mut self, path: PathBuf) -> Result<Reply> {
+        let capture = offscreen::render(
+            &self.graphics.device,
+            &mut self.renderer,
+            &self.app.scene(),
+            &self.bitmaps,
+        )?;
+        offscreen::write_png(&path, &capture)?;
+        Ok(Reply::Screenshot {
+            path,
+            size: capture.size,
+        })
+    }
+
+    /// The selected image, if the first frame should wait for its decode.
+    fn awaited(&self) -> Option<ImageId> {
+        self.app
+            .set()
+            .selected()
+            .filter(|image| !self.bitmaps.contains_key(image) && !self.failed.contains(image))
+    }
+
+    /// Shows a hidden window once there is something to see: the selected
+    /// image, or why it can't be shown, or, after a wait, an empty set.
+    fn show_if_ready(&mut self) {
+        let Visibility::Hidden { activate, waited } = self.visibility else {
+            return;
+        };
+        let ready = match self.app.set().selected() {
+            Some(_) => self.awaited().is_none(),
+            None => waited,
+        };
+        if ready {
+            if self.dirty {
+                let _ = self.present();
+            }
+            window::show(self.hwnd, activate);
+            self.visibility = Visibility::Shown;
+            self.timings.mark("shown");
+        }
+    }
+
+    /// Takes a decode's output: keeps the bitmap if it is better than the one
+    /// held, and tells the app.
     fn accept(&mut self, output: Output) {
         let preview = output.target != DecodeTarget::Full;
         let (started, finished) = if preview {
@@ -256,72 +598,70 @@ impl Viewer {
         } else {
             ("full_decode_started", "full_decoded")
         };
-        self.timings.record(started, output.started);
-        self.timings.record(finished, output.finished);
-        let decoded = match output.result {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                if self.image.is_none() {
-                    self.error = Some(error);
-                }
-                return;
-            }
-        };
-        if self
-            .image
-            .is_some_and(|shown| shown.bitmap_size.width >= decoded.bitmap_size.width)
-        {
+        self.timings.record_first(started, output.started);
+        self.timings.record_first(finished, output.finished);
+        let image = output.image;
+        if self.app.set().get(image).is_none() {
             return;
         }
-        let bitmap = match self.device.create_bitmap(&decoded) {
-            Ok(bitmap) => bitmap,
-            Err(error) => {
-                self.error.get_or_insert(error);
-                return;
-            }
+        let decoded = match output.result {
+            Ok(decoded) => decoded,
+            Err(error) => return self.failed(image, error),
         };
-        self.bitmaps.insert(output.image, bitmap);
-        self.image = Some(Shown {
-            size: decoded.size,
-            bitmap_size: decoded.bitmap_size,
-        });
-        self.error = None;
-        if preview
-            && decoded.bitmap_size != decoded.size
-            && let Some(path) = &self.path
+        // A preview that is the full image needs no full decode after it.
+        let target = if decoded.bitmap_size == decoded.size {
+            DecodeTarget::Full
+        } else {
+            output.target
+        };
+        let size = decoded.size;
+        if self
+            .bitmap_sizes
+            .get(&image)
+            .is_none_or(|held| held.width < decoded.bitmap_size.width)
         {
-            self.worker.submit(Job {
-                image: output.image,
-                path: path.clone(),
-                target: DecodeTarget::Full,
-            });
+            match self.graphics.device.create_bitmap(&decoded) {
+                Ok(bitmap) => {
+                    self.bitmaps.insert(image, bitmap);
+                    self.bitmap_sizes.insert(image, decoded.bitmap_size);
+                    if self.upgrade.is_some() {
+                        self.pixels.insert(image, decoded);
+                    }
+                }
+                Err(error) => return self.failed(image, error),
+            }
         }
-        if self.upgrade.is_some() {
-            self.pixels = Some(decoded);
+        self.failed.remove(&image);
+        self.handle(Input::Decoded {
+            image,
+            target,
+            size,
+        });
+    }
+
+    fn failed(&mut self, image: ImageId, error: Error) {
+        if self.app.set().selected() == Some(image) {
+            self.first_error.get_or_insert(error.clone());
         }
+        self.failed.insert(image);
+        self.handle(Input::DecodeFailed { image, error });
     }
 
     /// Draws the frame and presents it.
     fn present(&mut self) -> Result<()> {
-        let scene = self.scene();
+        self.dirty = false;
+        let scene = self.app.scene();
+        let graphics = &self.graphics;
         draw(
-            &self.device,
-            &self.swap_chain,
+            &graphics.device,
+            &graphics.swap_chain,
             &mut self.renderer,
             &scene,
             &self.bitmaps,
         )
     }
 
-    fn scene(&self) -> Scene {
-        scene(
-            self.swap_chain.size(),
-            self.image.map(|shown| shown.size),
-            self.error.as_ref(),
-        )
-    }
-
-    /// Moves to the hardware device, if it is ready: uploads the image,
+    /// Moves to the hardware device, if it is ready: uploads the images,
     /// draws the frame there, and shows it in place of WARP's.
     fn upgrade(&mut self) -> Result<()> {
         let Some(upgrade) = self.upgrade.take() else {
@@ -336,19 +676,25 @@ impl Viewer {
             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
         };
         drop(upgrade);
-        let pixels = self.pixels.take();
+        let pixels = std::mem::take(&mut self.pixels);
         self.timings.record("hardware_device_created", ready);
         let device = Device::from_hardware(d3d?)?;
-        let swap_chain = SwapChain::new(&device, self.swap_chain.size())?;
+        let swap_chain = SwapChain::new(&device, self.graphics.swap_chain.size())?;
         let mut bitmaps = Bitmaps::new();
-        if let Some(pixels) = pixels {
-            bitmaps.insert(IMAGE, device.create_bitmap(&pixels)?);
+        for (image, decoded) in &pixels {
+            bitmaps.insert(*image, device.create_bitmap(decoded)?);
         }
         let mut renderer = Renderer::default();
-        draw(&device, &swap_chain, &mut renderer, &self.scene(), &bitmaps)?;
-        self.composition.show(&swap_chain)?;
-        self.device = device;
-        self.swap_chain = swap_chain;
+        draw(
+            &device,
+            &swap_chain,
+            &mut renderer,
+            &self.app.scene(),
+            &bitmaps,
+        )?;
+        self.graphics.composition.show(&swap_chain)?;
+        self.graphics.device = device;
+        self.graphics.swap_chain = swap_chain;
         self.renderer = renderer;
         self.bitmaps = bitmaps;
         self.timings.mark("hardware_shown");
@@ -377,20 +723,21 @@ impl Handler for Viewer {
     }
 
     fn resize(&mut self, size: PixelSize) {
-        if self.swap_chain.resize(size).is_ok() {
-            let _ = self.present();
+        // A minimised window has no client area; keep the last frame.
+        if size.width == 0 || size.height == 0 {
+            return;
         }
+        let _ = self.graphics.swap_chain.resize(size);
+        self.handle(Input::Resize { size });
+        self.dirty = true;
+        self.finish();
     }
 
     fn decoded(&mut self) {
-        let mut any = false;
         while let Some(output) = self.worker.try_recv() {
             self.accept(output);
-            any = true;
         }
-        if any {
-            let _ = self.present();
-        }
+        self.finish();
     }
 
     fn device_ready(&mut self) {
@@ -398,51 +745,45 @@ impl Handler for Viewer {
         // more slowly.
         let _ = self.upgrade();
     }
-}
 
-/// What to draw: the image fitted to the client area, or why it can't be
-/// shown.
-fn scene(client: PixelSize, image: Option<PixelSize>, error: Option<&Error>) -> Scene {
-    let whole = Rect::new(0.0, 0.0, f64::from(client.width), f64::from(client.height));
-    let mut items = Vec::new();
-    if let Some(size) = image {
-        items.push(Item::Image {
-            image: IMAGE,
-            size,
-            transform: fit(size, client),
-            clip: whole,
-            interpolation: Interpolation::Smooth,
-            opacity: 1.0,
-        });
-    } else if let Some(error) = error {
-        items.push(Item::Text {
-            text: error.message.clone(),
-            rect: Rect::new(16.0, 0.0, (whole.width - 32.0).max(0.0), whole.height),
-            colour: MESSAGE,
-            size: 16.0,
-            align: Align::Centre,
-            bold: false,
-        });
+    fn requests(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                PipeEvent::Request(request, responder) => {
+                    let id = responder.id();
+                    self.responders.insert(id, responder);
+                    self.handle(Input::Request { id, request });
+                }
+                PipeEvent::Disconnected(id) => {
+                    self.responders.remove(&id);
+                    self.handle(Input::Disconnected { id });
+                }
+            }
+        }
+        self.finish();
     }
-    Scene {
-        size: client,
-        background: BACKGROUND,
-        items,
-    }
-}
 
-/// Maps an image of `image` pixels into the middle of a client area of
-/// `client` pixels, as large as fits without enlarging it.
-fn fit(image: PixelSize, client: PixelSize) -> Transform {
-    if image.width == 0 || image.height == 0 {
-        return Transform::IDENTITY;
+    fn timer(&mut self, id: usize) {
+        match id {
+            WAKE_TIMER => self.handle(Input::Tick),
+            SHOW_TIMER => {
+                if let Visibility::Hidden { waited, .. } = &mut self.visibility {
+                    *waited = true;
+                }
+            }
+            _ => {}
+        }
+        self.finish();
     }
-    let (iw, ih) = (f64::from(image.width), f64::from(image.height));
-    let (cw, ch) = (f64::from(client.width), f64::from(client.height));
-    let scale = (cw / iw).min(ch / ih).min(1.0);
-    let dx = ((cw - iw * scale) / 2.0).round();
-    let dy = ((ch - ih * scale) / 2.0).round();
-    Transform::scale(scale, scale).then(&Transform::translation(dx, dy))
+
+    fn input(&mut self, input: Input) {
+        self.handle(input);
+        self.finish();
+    }
+
+    fn cursor(&mut self) -> Cursor {
+        self.cursor
+    }
 }
 
 /// Lets a GUI-subsystem process print to the console it was started from.
@@ -465,9 +806,15 @@ fn attach_parent_console() {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
-    use crate::error::ErrorCode;
-    use crate::model::geometry::Point;
+    use crate::model::app::{Key, Modifiers};
+    use crate::model::geometry::PixelRect;
+    use crate::protocol::{ListReply, LoadState};
+    use crate::testutil::{
+        Format, Pixels, Rgba, TempDir, read_image, unique_instance, write_image,
+    };
 
     fn strs(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -480,53 +827,187 @@ mod tests {
         assert_eq!(run(strs(&["--instance", "no spaces"])), 2);
     }
 
+    /// Runs a headless viewer on its own thread, as `seerw --headless` would
+    /// run, and returns once it serves its pipe.
+    fn headless(instance: &InstanceName, files: &[&Path]) -> JoinHandle<u8> {
+        let mut args = strs(&["--headless", "--instance", instance.as_str()]);
+        args.extend(files.iter().map(|file| file.as_os_str().to_owned()));
+        let thread = std::thread::spawn(move || run(args));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client::connect(instance).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the viewer never served its pipe"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        thread
+    }
+
+    fn list(instance: &InstanceName) -> ListReply {
+        match client::send(instance, &Request::List).unwrap() {
+            Reply::List(list) => list,
+            other => panic!("unexpected reply {other:?}"),
+        }
+    }
+
+    fn wait_until_loaded(instance: &InstanceName, count: usize) -> ListReply {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let list = list(instance);
+            if list.images.len() == count
+                && list
+                    .images
+                    .iter()
+                    .all(|image| matches!(image.state, LoadState::Loaded | LoadState::Failed))
+            {
+                return list;
+            }
+            assert!(Instant::now() < deadline, "never loaded: {list:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn graphics(window: &Window) -> Graphics {
+        let device = Device::warp().unwrap();
+        Graphics {
+            swap_chain: SwapChain::new(&device, window.client_size()).unwrap(),
+            device,
+            composition: Composition::new(window.hwnd()).unwrap(),
+        }
+    }
+
+    fn app(window: &Window, headless: bool) -> App {
+        let config = Config {
+            headless,
+            size: window.client_size(),
+            dpi: 96,
+            dark: true,
+        };
+        App::new(config, Box::new(DiskFiles), Instant::now())
+    }
+
+    fn key(key: Key) -> Input {
+        Input::Key {
+            key,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
     #[test]
-    fn an_empty_headless_viewer_starts_and_exits() {
-        assert_eq!(run(strs(&["--headless"])), 0);
+    fn a_headless_viewer_serves_requests_until_told_to_quit() {
+        let dir = TempDir::new().unwrap();
+        let red = dir.join("red.png");
+        let blue = dir.join("blue.png");
+        write_image(&red, &Pixels::solid(40, 30, Rgba::RED), Format::Png).unwrap();
+        write_image(&blue, &Pixels::solid(40, 30, Rgba::BLUE), Format::Png).unwrap();
+        let instance = InstanceName::new(&unique_instance()).unwrap();
+        let viewer = headless(&instance, &[&red]);
+
+        // A second viewer on the instance hands its file over and exits.
+        let second = strs(&["--instance", instance.as_str(), blue.to_str().unwrap()]);
+        assert_eq!(run(second), 0);
+        let list = wait_until_loaded(&instance, 2);
+        assert_eq!(list.selected, Some(list.images[1].id));
+        assert_eq!(list.images[0].size, Some(PixelSize::new(40, 30)));
+
+        let input = Request::DebugInput {
+            events: vec![
+                serde_json::from_str(r#"{"type":"resize","size":{"width":80,"height":60}}"#)
+                    .unwrap(),
+                serde_json::from_str(r#"{"type":"key","key":"left"}"#).unwrap(),
+            ],
+        };
+        assert_eq!(client::send(&instance, &input).unwrap(), Reply::Done);
+        let shot = dir.join("shot.png");
+        let reply = client::send(&instance, &Request::Screenshot { path: shot.clone() }).unwrap();
+        assert_eq!(
+            reply,
+            Reply::Screenshot {
+                path: shot.clone(),
+                size: PixelSize::new(80, 60)
+            }
+        );
+        assert_eq!(read_image(&shot).unwrap().get(40, 30), Rgba::RED);
+
+        let Reply::Timings(timings) = client::send(&instance, &Request::DebugTimings).unwrap()
+        else {
+            panic!("no timings");
+        };
+        let names: Vec<&str> = timings.phases.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"first_present"), "{names:?}");
+        assert!(!names.contains(&"shown"), "{names:?}");
+
+        let unwritable = dir.join("no such directory").join("shot.png");
+        let error = client::send(&instance, &Request::Screenshot { path: unwritable }).unwrap_err();
+        assert_ne!(error.code, ErrorCode::NoViewer);
+
+        assert_eq!(
+            client::send(&instance, &Request::Quit).unwrap(),
+            Reply::Done
+        );
+        assert_eq!(viewer.join().unwrap(), 0);
+        assert!(!instance.is_taken());
+    }
+
+    #[test]
+    fn an_empty_headless_viewer_starts_and_quits() {
+        let instance = InstanceName::new(&unique_instance()).unwrap();
+        let viewer = headless(&instance, &[]);
+        assert!(list(&instance).images.is_empty());
+        // A second viewer with no files leaves the first alone.
+        assert_eq!(run(strs(&["--instance", instance.as_str()])), 0);
+        assert_eq!(
+            client::send(&instance, &Request::Quit).unwrap(),
+            Reply::Done
+        );
+        assert_eq!(viewer.join().unwrap(), 0);
     }
 
     #[test]
     fn the_viewer_moves_to_the_hardware_device_without_a_blank_frame() {
-        use crate::model::geometry::PixelRect;
-        use crate::testutil::{Format, Pixels, Rgba, TempDir, write_image};
         let dir = TempDir::new().unwrap();
         let path = dir.join("image.png");
         write_image(&path, &Pixels::solid(640, 480, Rgba::GREEN), Format::Png).unwrap();
         let window = Window::create(PixelRect::new(0, 0, 400, 300), "upgrade").unwrap();
         let hwnd = Arc::new(AtomicIsize::new(window.hwnd().0 as isize));
-        let device = Device::warp().unwrap();
-        let mut viewer = Viewer {
-            swap_chain: SwapChain::new(&device, window.client_size()).unwrap(),
-            device,
-            composition: Composition::new(window.hwnd()).unwrap(),
-            renderer: Renderer::default(),
-            bitmaps: Bitmaps::new(),
-            path: Some(path.clone()),
-            image: None,
-            pixels: None,
-            error: None,
-            worker: Worker::spawn(|| {}),
-            upgrade: Some(Upgrade::spawn(hwnd)),
-            timings: Timings::start(),
-        };
-        viewer.worker.submit(Job {
-            image: IMAGE,
-            path,
-            target: DecodeTarget::Fit {
-                within: PixelSize::new(400, 300),
-            },
+        let (_events, received) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            window.hwnd(),
+            app(&window, false),
+            graphics(&window),
+            Worker::spawn(|| {}),
+            Some(Upgrade::spawn(hwnd)),
+            Timings::start(),
+            received,
+        );
+        viewer.handle(Input::Request {
+            id: COMMAND_LINE,
+            request: open_request(&[path.clone(), dir.join("absent.png")], false),
         });
+        assert_eq!(
+            viewer.first_error.as_ref().unwrap().code,
+            ErrorCode::FileNotFound
+        );
+        let image = viewer.awaited().unwrap();
         let output = viewer.worker.recv().unwrap();
         viewer.accept(output);
-        assert_eq!(viewer.image.unwrap().bitmap_size, PixelSize::new(400, 300));
-        assert!(viewer.pixels.is_some());
+        assert_eq!(viewer.bitmap_sizes[&image], PixelSize::new(400, 300));
+        assert!(viewer.awaited().is_none());
+        assert!(viewer.pixels.contains_key(&image));
         viewer.paint();
-        // The full decode follows the preview.
+        // The app asks for the full decode once the preview is shown.
         let output = viewer.worker.recv().unwrap();
         viewer.accept(output);
-        assert_eq!(viewer.image.unwrap().bitmap_size, PixelSize::new(640, 480));
+        assert_eq!(viewer.bitmap_sizes[&image], PixelSize::new(640, 480));
         viewer.resize(PixelSize::new(200, 100));
-        assert_eq!(viewer.swap_chain.size(), PixelSize::new(200, 100));
+        viewer.resize(PixelSize::new(0, 0));
+        assert_eq!(viewer.graphics.swap_chain.size(), PixelSize::new(200, 100));
+        viewer.input(key(Key::Char('1')));
+        assert_eq!(viewer.cursor(), Cursor::Arrow);
+        viewer.timer(WAKE_TIMER);
+        viewer.timer(SHOW_TIMER);
+        viewer.timer(99);
         // Wait for the device thread, then move to its device.
         viewer
             .upgrade
@@ -538,48 +1019,42 @@ mod tests {
             .join()
             .unwrap();
         viewer.device_ready();
-        assert!(viewer.upgrade.is_none() && viewer.pixels.is_none());
+        assert!(viewer.upgrade.is_none() && viewer.pixels.is_empty());
         assert_eq!(viewer.bitmaps.len(), 1);
         viewer.decoded();
         viewer.device_ready();
+        viewer.requests();
+        assert!(window::title(window.hwnd()).starts_with("image.png — 640 × 480"));
+        // Closing the image drops its bitmap.
+        viewer.input(key(Key::Delete));
+        assert!(viewer.bitmaps.is_empty());
+        assert_eq!(window::title(window.hwnd()), "Seer");
     }
 
     #[test]
-    fn fitting_centres_without_enlarging() {
-        let client = PixelSize::new(800, 600);
-        let large = fit(PixelSize::new(1600, 600), client);
-        assert_eq!(large.apply(Point::new(0.0, 0.0)), Point::new(0.0, 150.0));
-        assert_eq!(
-            large.apply(Point::new(1600.0, 600.0)),
-            Point::new(800.0, 450.0)
+    fn a_file_that_cannot_be_decoded_is_reported() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.join("not an image.png");
+        std::fs::write(&path, b"not an image").unwrap();
+        let window = Window::create(PixelRect::new(0, 0, 100, 100), "failed").unwrap();
+        let (_events, received) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            window.hwnd(),
+            app(&window, true),
+            graphics(&window),
+            Worker::spawn(|| {}),
+            None,
+            Timings::start(),
+            received,
         );
-        let small = fit(PixelSize::new(100, 50), client);
-        assert_eq!(small.apply(Point::new(0.0, 0.0)), Point::new(350.0, 275.0));
-        assert_eq!(
-            small.apply(Point::new(100.0, 50.0)),
-            Point::new(450.0, 325.0)
-        );
-        assert_eq!(fit(PixelSize::new(0, 5), client), Transform::IDENTITY);
-    }
-
-    #[test]
-    fn scenes_show_the_image_or_the_error() {
-        let client = PixelSize::new(100, 100);
-        let shown = scene(client, Some(PixelSize::new(10, 10)), None);
-        assert!(matches!(
-            shown.items[..],
-            [Item::Image { image: IMAGE, .. }]
-        ));
-        assert_eq!(shown.background, BACKGROUND);
-        let error = Error::new(ErrorCode::FileNotFound, "gone");
-        let failed = scene(client, None, Some(&error));
-        assert!(matches!(&failed.items[..], [Item::Text { text, .. }] if text == "gone"));
-        assert!(scene(client, None, None).items.is_empty());
-    }
-
-    #[test]
-    fn titles_name_the_file() {
-        assert_eq!(title(Some(Path::new(r"C:\pictures\cat.jpg"))), "cat.jpg");
-        assert_eq!(title(None), "Seer");
+        viewer.handle(Input::Request {
+            id: COMMAND_LINE,
+            request: open_request(&[path], true),
+        });
+        let output = viewer.worker.recv().unwrap();
+        viewer.accept(output);
+        assert!(viewer.awaited().is_none());
+        assert_eq!(viewer.first_error.as_ref().unwrap().exit_code(), 4);
+        viewer.finish();
     }
 }

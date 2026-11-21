@@ -1322,9 +1322,7 @@ impl App {
                 let target = if self.size.width == 0 || self.size.height == 0 {
                     DecodeTarget::Full
                 } else {
-                    DecodeTarget::Scaled {
-                        at_least: self.size,
-                    }
+                    DecodeTarget::Fit { within: self.size }
                 };
                 let state = ImageState::new(target == DecodeTarget::Full);
                 if retry {
@@ -2530,7 +2528,7 @@ mod session_tests {
         assert!(effects.contains(&Effect::Decode {
             image: ImageId(1),
             path: path.clone(),
-            target: DecodeTarget::Scaled { at_least: WINDOW },
+            target: DecodeTarget::Fit { within: WINDOW },
         }));
         assert!(effects.contains(&Effect::FlashTaskbar));
         assert_eq!(session.list().images[0].state, LoadState::Loading);
@@ -2599,7 +2597,7 @@ mod session_tests {
         assert!(effects.contains(&Effect::Decode {
             image: ImageId(1),
             path: r"C:\bad.png".into(),
-            target: DecodeTarget::Scaled { at_least: WINDOW },
+            target: DecodeTarget::Fit { within: WINDOW },
         }));
         let list = session.list();
         assert_eq!(list.images[0].state, LoadState::Loading);
@@ -2610,7 +2608,7 @@ mod session_tests {
     fn previews_are_followed_by_full_decodes_of_shown_images() {
         let mut session = Session::new();
         session.open(&[r"C:\a.png", r"C:\b.png"]);
-        let scaled = DecodeTarget::Scaled { at_least: WINDOW };
+        let scaled = DecodeTarget::Fit { within: WINDOW };
         let full = |image| Effect::Decode {
             image: ImageId(image),
             path: if image == 1 { r"C:\a.png" } else { r"C:\b.png" }.into(),

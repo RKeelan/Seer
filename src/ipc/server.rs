@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -98,12 +98,15 @@ impl Responder {
 }
 
 /// A running pipe server. Dropping it stops accepting clients; connections
-/// already accepted carry on until they are answered.
+/// already accepted carry on until they are answered, unless the process
+/// exits first, which [`Server::stop`] waits for.
 #[derive(Debug)]
 pub struct Server {
     instance: InstanceName,
     stop: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
+    /// The connections not yet finished with.
+    active: Arc<AtomicUsize>,
 }
 
 impl Server {
@@ -125,18 +128,35 @@ impl Server {
             }
         })?;
         let stop = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicUsize::new(0));
         let listener = {
             let stop = Arc::clone(&stop);
+            let active = Arc::clone(&active);
             let handler: Arc<dyn Handler> = Arc::new(handler);
             thread::Builder::new()
                 .name("seer-pipe".into())
-                .spawn(move || listen(first, &name, &security, &stop, &handler))?
+                .spawn(move || listen(first, &name, &security, &stop, &active, &handler))?
         };
         Ok(Server {
             instance: instance.clone(),
             stop,
             listener: Some(listener),
+            active,
         })
+    }
+
+    /// Stops accepting clients, then waits up to `timeout` for the
+    /// connections already accepted to deliver their answers, so a process
+    /// that exits next does not cut off a reply it has just given, such as
+    /// the one to `quit`. Requests still unanswered after the handler has
+    /// dropped their responders are answered with an error.
+    pub fn stop(self, timeout: Duration) {
+        let active = Arc::clone(&self.active);
+        drop(self);
+        let deadline = Instant::now() + timeout;
+        while active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -167,6 +187,7 @@ fn listen(
     name: &HSTRING,
     security: &CurrentUserOnly,
     stop: &AtomicBool,
+    active: &Arc<AtomicUsize>,
     handler: &Arc<dyn Handler>,
 ) {
     let next_id = AtomicU64::new(1);
@@ -191,9 +212,17 @@ fn listen(
         if connected {
             let id = RequestId(next_id.fetch_add(1, Ordering::Relaxed));
             let handler = Arc::clone(handler);
-            let _ = thread::Builder::new()
+            let counter = Arc::clone(active);
+            active.fetch_add(1, Ordering::SeqCst);
+            let spawned = thread::Builder::new()
                 .name("seer-client".into())
-                .spawn(move || serve(&pipe, id, handler.as_ref()));
+                .spawn(move || {
+                    serve(&pipe, id, handler.as_ref());
+                    counter.fetch_sub(1, Ordering::SeqCst);
+                });
+            if spawned.is_err() {
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -527,6 +556,30 @@ mod tests {
         }
         let id = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(id.0 >= 1);
+    }
+
+    #[test]
+    fn stopping_waits_for_answers_to_be_delivered() {
+        let instance = instance();
+        let (sender, received) = mpsc::channel();
+        let server = Server::start(&instance, move |_request, responder| {
+            sender.send(responder).unwrap();
+        })
+        .unwrap();
+        let client = {
+            let instance = instance.clone();
+            thread::spawn(move || client::send(&instance, &Request::Quit))
+        };
+        let responder: Responder = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let answering = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            responder.respond(Ok(Reply::Done));
+        });
+        let started = Instant::now();
+        server.stop(Duration::from_secs(5));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(client.join().unwrap().unwrap(), Reply::Done);
+        answering.join().unwrap();
     }
 
     #[test]
