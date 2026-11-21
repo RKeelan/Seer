@@ -1,14 +1,14 @@
 //! Embeds the application manifest and icon in both executables.
 //!
-//! The icon is a placeholder drawn here rather than a checked-in file: a light
-//! lens with a dark pupil on a rounded slate square.
+//! The icon is drawn here rather than checked in: an open eye on a rounded
+//! blue square, simple enough to read at 16 pixels.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Icon sizes, in pixels, written into the `.ico`.
-const ICON_SIZES: [u32; 5] = [16, 24, 32, 48, 64];
+const ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("set by Cargo"));
@@ -123,21 +123,39 @@ fn pixel(size: u32, column: u32, row: u32) -> [u8; 4] {
     ]
 }
 
-/// The icon at a point in [-1, 1]², as straight RGBA in [0, 1].
+/// The icon at a point in [-1, 1]², y downwards, as straight RGBA in [0, 1]:
+/// an open eye, white with a blue iris and a dark pupil, on a rounded
+/// square of deep blue.
 fn sample(x: f32, y: f32) -> [f32; 4] {
-    // A rounded square with corner radius 0.35 inside the unit box.
-    let corner = 0.35;
+    const BACKGROUND: [f32; 4] = [0.09, 0.27, 0.52, 1.0];
+    const WHITE: [f32; 4] = [0.97, 0.98, 1.0, 1.0];
+    const IRIS: [f32; 4] = [0.20, 0.62, 0.93, 1.0];
+    const PUPIL: [f32; 4] = [0.05, 0.09, 0.17, 1.0];
+
+    // A rounded square with corner radius 0.3 filling the unit box.
+    let corner = 0.3;
     let qx = (x.abs() - (1.0 - corner)).max(0.0);
     let qy = (y.abs() - (1.0 - corner)).max(0.0);
     if (qx * qx + qy * qy).sqrt() > corner {
         return [0.0; 4];
     }
-    let radius = (x * x + y * y).sqrt();
-    if radius < 0.25 {
-        [0.11, 0.13, 0.17, 1.0] // pupil
-    } else if radius < 0.6 {
-        [0.36, 0.72, 0.94, 1.0] // iris
+
+    // The eye is the lens where two circles overlap: its corners are at
+    // (±HALF_WIDTH, 0) and its lids reach ±HALF_HEIGHT.
+    const HALF_WIDTH: f32 = 0.8;
+    const HALF_HEIGHT: f32 = 0.5;
+    let radius = (HALF_WIDTH * HALF_WIDTH + HALF_HEIGHT * HALF_HEIGHT) / (2.0 * HALF_HEIGHT);
+    let centre = radius - HALF_HEIGHT;
+    let in_lid = |cy: f32| x * x + (y - cy) * (y - cy) <= radius * radius;
+    if !(in_lid(centre) && in_lid(-centre)) {
+        return BACKGROUND;
+    }
+    let distance = (x * x + y * y).sqrt();
+    if distance < 0.16 {
+        PUPIL
+    } else if distance < 0.36 {
+        IRIS
     } else {
-        [0.17, 0.20, 0.26, 1.0] // background
+        WHITE
     }
 }
