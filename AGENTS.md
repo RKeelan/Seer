@@ -6,11 +6,13 @@ Seer is a fast, single-window image viewer for Windows, written in Rust as a nat
 
 - `cargo build` — build
 - `cargo test` — run the tests
-- `cargo llvm-cov --all-targets --ignore-filename-regex 'src[\\/]main\.rs$' --fail-under-lines 75` — run the tests with the coverage check CI enforces
+- `cargo llvm-cov --all-targets --ignore-filename-regex 'src[\\/]bin[\\/]' --fail-under-lines 75` — run the tests with the coverage check CI enforces
 - `cargo fmt --all` — format
 - `cargo clippy --all-targets -- -D warnings` — lint
 
-Keep `src/main.rs` a thin entry point that calls into the library: it is left out of the coverage measurement, so logic there goes untested.
+Keep `src/bin/seer.rs` and `src/bin/seerw.rs` thin entry points that call into the library: they are left out of the coverage measurement, so logic there goes untested.
+
+Every `unsafe` block carries a `// SAFETY:` comment saying why it is sound; clippy enforces this.
 
 ## Public repository
 
