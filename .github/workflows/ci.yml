@@ -38,4 +38,4 @@ jobs:
         run: cargo build --all-targets
 
       - name: Test with coverage
-        run: cargo llvm-cov --all-targets --ignore-filename-regex 'src[\\/]main\.rs$' --fail-under-lines 75
+        run: cargo llvm-cov --all-targets --ignore-filename-regex 'src[\\/]bin[\\/]' --fail-under-lines 75
