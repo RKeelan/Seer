@@ -283,6 +283,14 @@ pub enum DecodeTarget {
         /// The smallest acceptable size.
         at_least: PixelSize,
     },
+    /// A version large enough to show the whole image fitted within this
+    /// size without enlarging it, keeping the aspect ratio. Unlike `Scaled`,
+    /// it needs no knowledge of the image's shape, so it suits the first
+    /// decode of an image at window size.
+    Fit {
+        /// The area the image is fitted within.
+        within: PixelSize,
+    },
     /// The full-resolution image.
     Full,
     /// A thumbnail for the strip, no larger than this in either dimension.
@@ -1451,7 +1459,7 @@ impl App {
         state.error = None;
         match target {
             DecodeTarget::Full => state.state = LoadState::Loaded,
-            DecodeTarget::Scaled { .. } => {
+            DecodeTarget::Scaled { .. } | DecodeTarget::Fit { .. } => {
                 if state.state != LoadState::Loaded {
                     state.state = LoadState::Preview;
                 }

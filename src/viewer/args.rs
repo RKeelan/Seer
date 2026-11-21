@@ -2,9 +2,13 @@
 //! cold-start path.
 //!
 //! ```text
-//! seerw [--headless] [--instance <name>] [--no-activate] [--] <files…>
+//! seerw [--headless] [--instance <name>] [--no-activate] [--exit-after-first-frame] [--] <files…>
 //! seerw --version
 //! ```
+//!
+//! `--exit-after-first-frame` is for the start-up benchmark: the viewer prints
+//! its start-up timings as JSON on stdout once the first frame is presented,
+//! and exits.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -31,6 +35,8 @@ pub struct RunArgs {
     /// this way unless given `--activate`, so an agent never takes the focus
     /// from the user.
     pub no_activate: bool,
+    /// Print the start-up timings and exit once the first frame is presented.
+    pub exit_after_first_frame: bool,
     /// The files to open, as given.
     pub files: Vec<PathBuf>,
 }
@@ -54,6 +60,7 @@ where
             "--version" => return Ok(ViewerArgs::Version),
             "--headless" => run.headless = true,
             "--no-activate" => run.no_activate = true,
+            "--exit-after-first-frame" => run.exit_after_first_frame = true,
             "--instance" => {
                 let name = args
                     .next()
@@ -90,6 +97,7 @@ mod tests {
                 instance: Some("t1".into()),
                 no_activate: false,
                 files: vec!["a.png".into(), r"C:\b.jpg".into()],
+                ..RunArgs::default()
             })
         );
         assert_eq!(
@@ -103,6 +111,13 @@ mod tests {
             parse_strs(&["--no-activate"]).unwrap(),
             ViewerArgs::Run(RunArgs {
                 no_activate: true,
+                ..RunArgs::default()
+            })
+        );
+        assert_eq!(
+            parse_strs(&["--exit-after-first-frame"]).unwrap(),
+            ViewerArgs::Run(RunArgs {
+                exit_after_first_frame: true,
                 ..RunArgs::default()
             })
         );
