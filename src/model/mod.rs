@@ -9,7 +9,9 @@
 //!   and [`app::Effect`]s.
 //! - [`strip`]: the thumbnail strip's layout and scrolling.
 //! - [`geometry`]: points, sizes, rectangles, rotations and transforms.
+//! - [`animation`]: which frame of an animation is shown when.
 
+pub mod animation;
 pub mod app;
 pub mod geometry;
 pub mod marks;

@@ -169,6 +169,15 @@ pub enum Input {
         /// The image's full size in pixels, after EXIF orientation.
         size: PixelSize,
     },
+    /// The image last reported by [`Input::Decoded`] is an animation, and
+    /// holds this many frames, each of the image's full size.
+    #[serde(skip)]
+    Animated {
+        /// The image.
+        image: ImageId,
+        /// How many frames are held.
+        frames: u32,
+    },
     /// The decoder could not decode an image.
     #[serde(skip)]
     DecodeFailed {
@@ -846,6 +855,12 @@ impl App {
                 target,
                 size,
             } => self.decoded(image, target, size),
+            Input::Animated { image, frames } => {
+                if let Some(size) = self.images.get(&image).and_then(|state| state.size) {
+                    let frame = cache::bitmap_bytes(size, DecodeTarget::Full);
+                    self.cache.hold(image, frame * u64::from(frames));
+                }
+            }
             Input::DecodeFailed { image, error } => {
                 if let Some(state) = self.images.get_mut(&image) {
                     state.state = LoadState::Failed;
@@ -1482,6 +1497,16 @@ impl App {
             // The image is decoded when it is shown or next to the selection;
             // see `schedule`.
             let retry = existing && self.images[&id].state == LoadState::Failed;
+            // A file whose codec is missing is still decoded when its turn
+            // comes, so the window shows why it failed, but is reported now.
+            if (!existing || retry)
+                && let Some(error) = self.files.missing_codec(&file.path)
+            {
+                failed.push(OpenFailure {
+                    path: file.path.clone(),
+                    error,
+                });
+            }
             if retry {
                 let old = self.images.get_mut(&id).expect("in the set");
                 old.state = LoadState::Loading;
@@ -2579,6 +2604,11 @@ mod session_tests {
                 Ok(normalise(path))
             }
         }
+
+        fn missing_codec(&self, path: &Path) -> Option<Error> {
+            (path.extension()? == "webp")
+                .then(|| Error::new(ErrorCode::CodecMissing, "needs the WebP codec"))
+        }
     }
 
     const WINDOW: PixelSize = PixelSize::new(800, 600);
@@ -2837,6 +2867,25 @@ mod session_tests {
         session.decode(2, 400, 300);
         session.decode(3, 1600, 1200);
         session
+    }
+
+    #[test]
+    fn a_missing_codec_is_reported_at_open_and_still_decoded() {
+        let mut session = Session::new();
+        let (opened, effects) = session.open_with(&[r"C:\a.webp", r"C:\b.png"], None, false);
+        assert_eq!(opened.images.len(), 2);
+        assert_eq!(opened.failed.len(), 1);
+        assert_eq!(opened.failed[0].path, PathBuf::from(r"C:\a.webp"));
+        assert_eq!(opened.failed[0].error.code, ErrorCode::CodecMissing);
+        // It is shown, so it is decoded, and fails there too.
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Decode {
+                image: ImageId(1),
+                target: DecodeTarget::Fit { .. },
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -3256,6 +3305,32 @@ mod session_tests {
         let effects = session.key(Key::Delete);
         assert!(decodes(&effects).cancelled.contains(&3));
         assert_eq!(decodes(&effects).evicted, [3]);
+    }
+
+    #[test]
+    fn an_animation_costs_every_frame_it_holds() {
+        let mut session = Session::new();
+        // One 100 × 100 frame takes 40 000 bytes; three fit, but not four.
+        session.app.set_cache_budget(130_000);
+        session.open(&[r"C:\1.gif", r"C:\2.png", r"C:\3.png"]);
+        session.decode(1, 100, 100);
+        session.decode(2, 100, 100);
+        session.key(Key::Right);
+        session.decode(3, 100, 100);
+        // 1 is a neighbour of 2, so it stays whatever it costs.
+        let effects = session.send(Input::Animated {
+            image: ImageId(1),
+            frames: 2,
+        });
+        assert!(decodes(&effects).evicted.is_empty());
+        // Once it is not, its frames push the cache over the budget.
+        let effects = session.key(Key::Right);
+        assert_eq!(decodes(&effects).evicted, [1]);
+        // An image that is gone costs nothing.
+        session.send(Input::Animated {
+            image: ImageId(9),
+            frames: 2,
+        });
     }
 
     #[test]

@@ -21,16 +21,20 @@ use crate::model::ImageId;
 use crate::model::geometry::{Point, Rect, Transform};
 use crate::render::scene::{Colour, Interpolation, Item, Scene};
 use crate::render::text::{Line, Text};
+use crate::render::vector::Vectors;
 
 /// The decoded bitmaps the renderer can draw, by image.
 pub type Bitmaps = HashMap<ImageId, ID2D1Bitmap1>;
 
 /// Draws scenes. It keeps what is worth keeping between frames: DirectWrite
-/// state and the dash style.
+/// state, the dash style, and the SVG images it draws as vectors in place of
+/// their bitmaps.
 #[derive(Default)]
 pub struct Renderer {
     text: Text,
     dashes: Option<ID2D1StrokeStyle>,
+    /// The images drawn as vectors.
+    pub vectors: Vectors,
 }
 
 impl Renderer {
@@ -78,6 +82,17 @@ impl Renderer {
                     interpolation,
                     opacity,
                 } => {
+                    if *opacity >= 1.0
+                        && self.vectors.draw(
+                            context,
+                            *image,
+                            *size,
+                            &matrix(transform),
+                            &rect(*clip),
+                        )
+                    {
+                        continue;
+                    }
                     let Some(bitmap) = bitmaps.get(image) else {
                         continue;
                     };

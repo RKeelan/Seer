@@ -67,6 +67,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Gdi::{HBRUSH, HDC};
 use windows::Win32::System::Console::{
@@ -80,13 +81,15 @@ use self::timing::Timings;
 use self::watch::{Reloads, Watcher};
 use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, WM_FILES_CHANGED, WM_REQUEST, Window};
 use crate::decode::cache;
-use crate::decode::wic::Decoded;
+use crate::decode::gif::Animation;
+use crate::decode::wic::{Content, Decoded};
 use crate::decode::worker::{Job, Output, Worker};
 use crate::error::{Error, ErrorCode, Result};
 use crate::ipc::client;
 use crate::ipc::instance::{InstanceMutex, InstanceName};
 use crate::ipc::server::{self, Responder, Server};
 use crate::model::ImageId;
+use crate::model::animation::Playback;
 use crate::model::app::{App, Config, Cursor, DecodeTarget, Effect, Input, RequestId};
 use crate::model::geometry::{PixelSize, Rect};
 use crate::model::set::DiskFiles;
@@ -94,7 +97,7 @@ use crate::protocol::{OpenFile, Reply, Request, Response};
 use crate::render::device::{Composition, Device, SwapChain, hardware_device};
 use crate::render::draw::{Bitmaps, Renderer};
 use crate::render::offscreen;
-use crate::render::scene::Scene;
+use crate::render::scene::{Item, Scene};
 
 /// The id of the request the viewer makes of itself to open the files on its
 /// command line. The pipe server numbers its requests from 1.
@@ -109,6 +112,9 @@ const SHOW_TIMER: usize = 2;
 
 /// The timer that reloads changed files once they are due.
 const RELOAD_TIMER: usize = 3;
+
+/// The timer that shows an animation's next frame.
+const ANIMATION_TIMER: usize = 4;
 
 /// How long a viewer started with no files waits for an image before showing
 /// its window empty.
@@ -454,6 +460,39 @@ struct Graphics {
     composition: Composition,
 }
 
+/// An animated image's frames on the device, and where it is in them.
+struct Animated {
+    frames: Vec<ID2D1Bitmap1>,
+    playback: Playback,
+}
+
+impl Animated {
+    /// Uploads `animation`'s frames, each of `size`, to `device`, keeping
+    /// `playback`'s place or starting from the first frame.
+    fn new(
+        device: &Device,
+        size: PixelSize,
+        animation: &Animation,
+        playback: Option<Playback>,
+    ) -> Result<Self> {
+        let frames = animation
+            .frames
+            .iter()
+            .map(|frame| device.create_bitmap_from(size, &frame.pixels))
+            .collect::<Result<Vec<_>>>()?;
+        let playback = playback.unwrap_or_else(|| {
+            let delays = animation.frames.iter().map(|frame| frame.delay).collect();
+            Playback::new(delays, animation.plays)
+        });
+        Ok(Animated { frames, playback })
+    }
+
+    /// The bitmap of the frame shown now.
+    fn shown(&self) -> ID2D1Bitmap1 {
+        self.frames[self.playback.frame()].clone()
+    }
+}
+
 /// The window's handler: runs [`App`] and carries out its effects.
 struct Viewer {
     hwnd: HWND,
@@ -472,6 +511,9 @@ struct Viewer {
     thumbnail_pixels: HashMap<ImageId, Decoded>,
     /// The images whose decode failed.
     failed: HashSet<ImageId>,
+    /// The animated images: every frame's bitmap, and where each is in its
+    /// frames. The shown frame's bitmap is also in `bitmaps`.
+    animations: HashMap<ImageId, Animated>,
     worker: Worker,
     /// Decodes thumbnails, on a thread of its own at background priority, so
     /// a thumbnail never holds up an image to be shown.
@@ -525,6 +567,7 @@ impl Viewer {
             thumbnails: Bitmaps::new(),
             thumbnail_pixels: HashMap::new(),
             failed: HashSet::new(),
+            animations: HashMap::new(),
             worker,
             thumbnailer: Worker::spawn_background(move || window::post(posted_to, WM_DECODED)),
             upgrade,
@@ -650,6 +693,8 @@ impl Viewer {
                         self.thumbnails.remove(&image);
                         self.thumbnail_pixels.remove(&image);
                     }
+                    self.animations.remove(&image);
+                    self.renderer.vectors.remove(image);
                 }
                 Effect::SetCursor { cursor } => self.cursor = cursor,
                 Effect::Activate => match &mut self.visibility {
@@ -696,6 +741,7 @@ impl Viewer {
     /// Presents the frame if it changed, and shows the window if it is ready
     /// to be seen.
     fn finish(&mut self) {
+        self.animate();
         if self.dirty {
             let _ = self.present();
         }
@@ -818,9 +864,8 @@ impl Viewer {
             if bitmap.is_err() && self.graphics.device.is_lost() && self.recover().is_ok() {
                 bitmap = self.graphics.device.create_bitmap(&decoded);
             }
-            match bitmap {
-                Ok(bitmap) => {
-                    self.bitmaps.insert(image, bitmap);
+            match bitmap.and_then(|bitmap| self.keep(image, bitmap, &decoded)) {
+                Ok(()) => {
                     self.bitmap_sizes.insert(image, decoded.bitmap_size);
                     if self.upgrade.is_some() {
                         self.pixels.insert(image, decoded);
@@ -835,6 +880,11 @@ impl Viewer {
             target,
             size,
         });
+        // The cache charges an animation for every frame it holds.
+        if let Some(animated) = self.animations.get(&image) {
+            let frames = u32::try_from(animated.frames.len()).unwrap_or(u32::MAX);
+            self.handle(Input::Animated { image, frames });
+        }
     }
 
     /// Reloads the changed files that are due, or marks them missing if
@@ -893,6 +943,67 @@ impl Viewer {
         });
     }
 
+    /// Shows `bitmap` for `image` from now on, with the animation or vectors
+    /// `decoded` carries.
+    fn keep(&mut self, image: ImageId, bitmap: ID2D1Bitmap1, decoded: &Decoded) -> Result<()> {
+        self.animations.remove(&image);
+        self.renderer.vectors.remove(image);
+        match &decoded.content {
+            Content::Still => {
+                self.bitmaps.insert(image, bitmap);
+            }
+            Content::Animation(animation) => {
+                let animated = Animated::new(&self.graphics.device, decoded.size, animation, None)?;
+                self.bitmaps.insert(image, animated.shown());
+                self.animations.insert(image, animated);
+            }
+            Content::Vector(source) => {
+                self.bitmaps.insert(image, bitmap);
+                self.renderer.vectors.insert(image, Arc::clone(source));
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves each animation on screen to the frame due now, pauses the
+    /// others, and sets the timer for the next frame due.
+    fn animate(&mut self) {
+        if self.animations.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let scene = self.app.scene();
+        let shown: HashSet<ImageId> = scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Image { image, .. } => Some(*image),
+                _ => None,
+            })
+            .collect();
+        let mut next: Option<Instant> = None;
+        for (image, animated) in &mut self.animations {
+            if !shown.contains(image) {
+                animated.playback.pause(now);
+                continue;
+            }
+            let before = animated.playback.frame();
+            if let Some(due) = animated.playback.advance(now) {
+                next = Some(next.map_or(due, |next| next.min(due)));
+            }
+            if animated.playback.frame() != before {
+                self.bitmaps.insert(*image, animated.shown());
+                self.dirty = true;
+            }
+        }
+        if let Some(due) = next {
+            let wait = due.saturating_duration_since(now);
+            // Round up, so the timer never fires before the frame is due.
+            let ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
+            window::set_timer(self.hwnd, ANIMATION_TIMER, ms.max(1));
+        }
+    }
+
     fn failed(&mut self, image: ImageId, error: Error) {
         if self.app.set().selected() == Some(image) {
             self.first_error.get_or_insert(error.clone());
@@ -942,12 +1053,17 @@ impl Viewer {
         let swap_chain = SwapChain::new(&device, self.graphics.swap_chain.size())?;
         self.graphics.device = device;
         self.graphics.swap_chain = swap_chain;
+        // SVG documents are remade on the new device from their text when
+        // next drawn; animations come back with the decodes asked for below.
+        let vectors = self.renderer.vectors.for_new_device();
         self.renderer = Renderer::default();
+        self.renderer.vectors = vectors;
         self.bitmaps.clear();
         self.bitmap_sizes.clear();
         self.pixels.clear();
         self.thumbnails.clear();
         self.thumbnail_pixels.clear();
+        self.animations.clear();
         self.handle(Input::DeviceLost);
         self.dirty = false;
         let graphics = &self.graphics;
@@ -983,14 +1099,23 @@ impl Viewer {
         let device = Device::from_hardware(d3d?)?;
         let swap_chain = SwapChain::new(&device, self.graphics.swap_chain.size())?;
         let mut bitmaps = Bitmaps::new();
+        let mut animations = HashMap::new();
         for (image, decoded) in &pixels {
-            bitmaps.insert(*image, device.create_bitmap(decoded)?);
+            if let Content::Animation(animation) = &decoded.content {
+                let playback = self.animations.get(image).map(|a| a.playback.clone());
+                let animated = Animated::new(&device, decoded.size, animation, playback)?;
+                bitmaps.insert(*image, animated.shown());
+                animations.insert(*image, animated);
+            } else {
+                bitmaps.insert(*image, device.create_bitmap(decoded)?);
+            }
         }
         let mut thumbnails = Bitmaps::new();
         for (image, decoded) in &thumbnail_pixels {
             thumbnails.insert(*image, device.create_bitmap(decoded)?);
         }
         let mut renderer = Renderer::default();
+        renderer.vectors = self.renderer.vectors.for_new_device();
         draw(
             &device,
             &swap_chain,
@@ -1005,6 +1130,7 @@ impl Viewer {
         self.renderer = renderer;
         self.bitmaps = bitmaps;
         self.thumbnails = thumbnails;
+        self.animations = animations;
         self.timings.mark("hardware_shown");
         Ok(())
     }
@@ -1078,6 +1204,8 @@ impl Handler for Viewer {
     fn timer(&mut self, id: usize) {
         match id {
             WAKE_TIMER => self.handle(Input::Tick),
+            // `finish` below moves the animations on.
+            ANIMATION_TIMER => {}
             SHOW_TIMER => {
                 if let Visibility::Hidden { waited, .. } = &mut self.visibility {
                     *waited = true;
@@ -1170,7 +1298,8 @@ mod tests {
     use crate::model::geometry::{PixelRect, Point};
     use crate::protocol::{ListReply, LoadState};
     use crate::testutil::{
-        Format, Pixels, Rgba, TempDir, read_image, unique_instance, write_image,
+        Format, GifFrame, Pixels, Rgba, TempDir, read_image, unique_instance, write_animated_gif,
+        write_image,
     };
 
     fn strs(args: &[&str]) -> Vec<OsString> {
@@ -1390,6 +1519,77 @@ mod tests {
     }
 
     #[test]
+    fn animations_and_vectors_survive_the_move_to_the_hardware_device() {
+        let dir = TempDir::new().unwrap();
+        let gif = dir.join("blink.gif");
+        let frames = [
+            GifFrame::whole(Pixels::solid(8, 8, Rgba::RED), 2),
+            GifFrame::whole(Pixels::solid(8, 8, Rgba::BLUE), 2),
+        ];
+        write_animated_gif(&gif, 8, 8, &frames, Some(0)).unwrap();
+        let svg = dir.join("square.svg");
+        std::fs::write(
+            &svg,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"/>"#,
+        )
+        .unwrap();
+        let window = Window::create(PixelRect::new(0, 0, 100, 100), "formats").unwrap();
+        let hwnd = Arc::new(AtomicIsize::new(window.hwnd().0 as isize));
+        let (_events, received) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            window.hwnd(),
+            app(&window, false),
+            graphics(&window),
+            Worker::spawn(|| {}),
+            Some(Upgrade::spawn(hwnd)),
+            Timings::start(),
+            received,
+        );
+        viewer.handle(Input::Request {
+            id: COMMAND_LINE,
+            request: open_request(&[gif, svg], false),
+        });
+        // The shown image decodes first; its neighbour is held back until
+        // decoding ahead starts.
+        let first = viewer.worker.recv().unwrap();
+        let animated = first.image;
+        viewer.accept(first);
+        viewer.start_prefetching();
+        let second = viewer.worker.recv().unwrap();
+        let vector = second.image;
+        viewer.accept(second);
+        assert_eq!(viewer.animations[&animated].frames.len(), 2);
+        assert!(viewer.renderer.vectors.contains(vector));
+        // The animation moves on while it is shown, and pauses when not.
+        viewer.finish();
+        std::thread::sleep(Duration::from_millis(120));
+        viewer.timer(ANIMATION_TIMER);
+        assert_eq!(viewer.animations[&animated].playback.frame(), 1);
+        viewer.input(key(Key::Right));
+
+        viewer
+            .upgrade
+            .as_mut()
+            .unwrap()
+            .thread
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        viewer.device_ready();
+        assert!(viewer.upgrade.is_none());
+        assert_eq!(viewer.animations[&animated].playback.frame(), 1);
+        assert!(viewer.renderer.vectors.contains(vector));
+        viewer.paint();
+
+        // Closing them drops their frames and documents.
+        viewer.input(key(Key::Delete));
+        assert!(!viewer.renderer.vectors.contains(vector));
+        viewer.input(key(Key::Delete));
+        assert!(viewer.animations.is_empty());
+    }
+
+    #[test]
     fn a_file_that_cannot_be_decoded_is_reported() {
         let dir = TempDir::new().unwrap();
         let path = dir.join("not an image.png");
@@ -1597,9 +1797,14 @@ mod tests {
     fn a_new_device_takes_over_with_every_image() {
         let dir = TempDir::new().unwrap();
         let red = dir.join("red.png");
-        let blue = dir.join("blue.png");
+        // Blue is an animation, whose frames are on the device too.
+        let blue = dir.join("blue.gif");
         write_image(&red, &Pixels::solid(40, 30, Rgba::RED), Format::Png).unwrap();
-        write_image(&blue, &Pixels::solid(40, 30, Rgba::BLUE), Format::Png).unwrap();
+        let frames = [
+            GifFrame::whole(Pixels::solid(40, 30, Rgba::BLUE), 10),
+            GifFrame::whole(Pixels::solid(40, 30, Rgba::BLUE), 10),
+        ];
+        write_animated_gif(&blue, 40, 30, &frames, Some(0)).unwrap();
         let window = Window::create(PixelRect::new(0, 0, 200, 160), "recover").unwrap();
         let (_events, received) = mpsc::channel();
         let mut viewer = Viewer::new(
@@ -1622,6 +1827,7 @@ mod tests {
             viewer.accept(output);
         }
         assert!(!viewer.graphics.device.is_lost());
+        assert_eq!(viewer.animations.len(), 1);
         let colour = |viewer: &Viewer| {
             let selected = viewer.app.set().selected().unwrap();
             if viewer.app.set().get(selected).unwrap().path == red {
@@ -1635,10 +1841,13 @@ mod tests {
         viewer.recover().unwrap();
         assert!(viewer.graphics.device.is_warp());
         assert!(viewer.bitmaps.is_empty() && viewer.pixels.is_empty());
+        assert!(viewer.animations.is_empty());
         while viewer.bitmaps.len() < 2 {
             let output = viewer.worker.recv().unwrap();
             viewer.accept(output);
         }
+        // The animation comes back with its decode, on the new device.
+        assert_eq!(viewer.animations.len(), 1);
         let shot = dir.join("shot.png");
         // The image sits in the middle of the area above the strip.
         let shown = |viewer: &mut Viewer| {

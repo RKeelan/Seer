@@ -136,7 +136,7 @@ fn unpremultiply(pixels: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::wic::Decoded;
+    use crate::decode::wic::{Content, Decoded};
     use crate::model::ImageId;
     use crate::model::geometry::{Point, Rect, Transform};
     use crate::render::scene::{Align, Colour, Interpolation, Item};
@@ -156,6 +156,7 @@ mod tests {
             size: PixelSize::new(4, 4),
             bitmap_size: PixelSize::new(4, 4),
             pixels: pixels.data,
+            content: Content::Still,
         }
     }
 
