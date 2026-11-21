@@ -781,16 +781,24 @@ impl App {
                 }
             }
             Input::FileChanged { image } => {
+                let shown = self.panes().iter().any(|pane| pane.image == image);
                 if let (Some(entry), Some(state)) =
                     (self.set.get(image), self.images.get_mut(&image))
                 {
                     state.missing = false;
-                    state.full_requested = true;
-                    effects.push(Effect::Decode {
-                        image,
-                        path: entry.path.clone(),
-                        target: DecodeTarget::Full,
-                    });
+                    if !shown && state.state == LoadState::Loaded {
+                        // Decoded again when next shown; until then the old
+                        // pixels stand in, as a preview does.
+                        state.state = LoadState::Preview;
+                        state.full_requested = false;
+                    } else {
+                        state.full_requested = true;
+                        effects.push(Effect::Decode {
+                            image,
+                            path: entry.path.clone(),
+                            target: DecodeTarget::Full,
+                        });
+                    }
                 }
             }
             Input::FileMissing { image } => {
@@ -2838,15 +2846,51 @@ mod session_tests {
     #[test]
     fn file_changes_reload_and_report_missing_files() {
         let mut session = three_images();
-        session.send(Input::FileMissing { image: ImageId(2) });
-        assert!(session.list().images[1].missing);
-        let effects = session.send(Input::FileChanged { image: ImageId(2) });
+        session.send(Input::FileMissing { image: ImageId(1) });
+        assert!(session.list().images[0].missing);
+        let effects = session.send(Input::FileChanged { image: ImageId(1) });
         assert!(effects.contains(&Effect::Decode {
-            image: ImageId(2),
-            path: r"C:\shots\two.png".into(),
+            image: ImageId(1),
+            path: r"C:\shots\one.png".into(),
             target: DecodeTarget::Full,
         }));
-        assert!(!session.list().images[1].missing);
+        assert!(!session.list().images[0].missing);
+    }
+
+    #[test]
+    fn a_changed_file_out_of_sight_is_decoded_when_next_shown() {
+        let mut session = three_images();
+        let selected = session.list().selected.unwrap();
+        let hidden = session
+            .list()
+            .images
+            .iter()
+            .map(|image| image.id)
+            .find(|&id| id != selected)
+            .unwrap();
+        let index = session.list().images.iter().position(|i| i.id == hidden);
+        let effects = session.send(Input::FileChanged { image: hidden });
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Decode { .. }))
+        );
+        assert_eq!(
+            session.list().images[index.unwrap()].state,
+            LoadState::Preview
+        );
+        // Selecting it asks for the full decode.
+        let mut asked = false;
+        for _ in 0..3 {
+            let effects = session.send(Input::Key {
+                key: Key::Right,
+                modifiers: Modifiers::NONE,
+            });
+            asked |= effects.iter().any(|effect| {
+                matches!(effect, Effect::Decode { image, target: DecodeTarget::Full, .. } if *image == hidden)
+            });
+        }
+        assert!(asked);
     }
 
     #[test]

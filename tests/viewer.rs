@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use seer::model::ImageId;
-use seer::model::geometry::PixelSize;
+use seer::model::geometry::{PixelSize, Rotation};
 use seer::protocol::{ListReply, LoadState, OpenReply, Reply, Timings};
 use seer::testutil::{
     Format, HeadlessViewer, Pixels, Rgba, TempDir, VIEWER_TIMEOUT, assert_similar, read_image,
@@ -120,6 +120,56 @@ fn an_agent_opens_navigates_and_reads_back_screenshots() {
     let view = list.view.unwrap();
     assert!(view.fit);
     assert_eq!(view.zoom, 1.0);
+
+    assert!(viewer.quit().success());
+}
+
+#[test]
+fn an_image_rewritten_on_disk_is_reloaded_and_a_deleted_one_kept() {
+    let dir = TempDir::new().unwrap();
+    let (path, _) = quadrants(
+        &dir,
+        "plot.png",
+        [Rgba::RED, Rgba::GREEN, Rgba::BLUE, Rgba::WHITE],
+    );
+    let viewer = viewer(&[&path]);
+    viewer.wait_until_loaded(1);
+    debug_input(
+        &viewer,
+        r#"{"type":"resize","size":{"width":128,"height":96}}"#,
+    );
+    let image = |list: &ListReply| list.images[0].clone();
+
+    // The program that made the image writes it again, in new colours.
+    let redrawn = Pixels::quadrants(64, 48, [Rgba::WHITE, Rgba::BLUE, Rgba::GREEN, Rgba::RED]);
+    write_image(&path, &redrawn, Format::Png).unwrap();
+    viewer.wait_for(|_| screenshot(&viewer, &dir, "poll.png").get(40, 30) == Rgba::WHITE);
+    assert_eq!(image(&viewer.list()).state, LoadState::Loaded);
+    assert_similar(
+        &centred(&redrawn),
+        &screenshot(&viewer, &dir, "redrawn.png"),
+        2,
+    );
+
+    // A rotation survives a reload, even one that changes the image's size.
+    debug_input(&viewer, r#"{"type":"key","key":"r"}"#);
+    let smaller = Pixels::solid(32, 24, Rgba::GREEN);
+    write_image(&path, &smaller, Format::Png).unwrap();
+    let list = viewer.wait_for(|list| image(list).size == Some(PixelSize::new(32, 24)));
+    assert_eq!(list.view.unwrap().rotation, Rotation::Clockwise90);
+
+    // A deleted file stays open, showing its last image.
+    std::fs::remove_file(&path).unwrap();
+    viewer.wait_for(|list| image(list).missing);
+    assert_eq!(
+        screenshot(&viewer, &dir, "deleted.png").get(64, 48),
+        Rgba::GREEN
+    );
+
+    // Written again, it is no longer missing.
+    write_image(&path, &redrawn, Format::Png).unwrap();
+    viewer
+        .wait_for(|list| !image(list).missing && image(list).size == Some(PixelSize::new(64, 48)));
 
     assert!(viewer.quit().success());
 }
