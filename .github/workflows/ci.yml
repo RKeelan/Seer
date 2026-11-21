@@ -39,3 +39,10 @@ jobs:
 
       - name: Test with coverage
         run: cargo llvm-cov --all-targets --ignore-filename-regex 'src[\\/]bin[\\/]' --fail-under-lines 75
+
+      # Runners have no GPU and vary widely, so the numbers are printed, not
+      # checked.
+      - name: Benchmark the cold start
+        run: |
+          cargo build --release
+          cargo run --release --example bench -- --headless
