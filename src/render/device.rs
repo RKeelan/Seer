@@ -279,9 +279,10 @@ impl Composition {
         // chains, which carry their own.
         let device: IDCompositionDesktopDevice =
             unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }?;
-        // SAFETY: the window belongs to this process; topmost puts the
-        // content above any the window draws itself.
-        let target = unsafe { device.CreateTargetForHwnd(window, true) }?;
+        // SAFETY: the window belongs to this process. Not topmost: the
+        // content goes behind the window's child windows, such as the note
+        // field, which would otherwise be hidden under it.
+        let target = unsafe { device.CreateTargetForHwnd(window, false) }?;
         // SAFETY: CreateVisual has no arguments.
         let visual = unsafe { device.CreateVisual() }?;
         // SAFETY: the visual was made by the same device as the target.
