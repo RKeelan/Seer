@@ -1,7 +1,7 @@
 //! Helpers for tests: image files generated through WIC's encoders, images
 //! read back through its decoders, pixel comparison, temporary directories,
-//! unique instance names, and [`HeadlessViewer`], which runs a viewer for
-//! end-to-end tests.
+//! unique instance names, shell item arrays such as Explorer hands over, and
+//! [`HeadlessViewer`], which runs a viewer for end-to-end tests.
 //!
 //! Test images are generated, never checked in. Unit tests get this module
 //! through `cfg(test)`; integration tests get it through the `testutil`
@@ -25,9 +25,13 @@ use windows::Win32::Graphics::Imaging::{
 };
 use windows::Win32::System::Com::StructuredStorage::{IPropertyBag2, PROPVARIANT};
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows::Win32::System::Variant::VT_UI2;
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{
+    IShellItemArray, SHCreateShellItemArrayFromIDLists, SHParseDisplayName,
+};
 use windows::core::{GUID, HSTRING, w};
 
 use crate::error::{Error, Result};
@@ -413,6 +417,44 @@ impl Drop for TempDir {
     }
 }
 
+/// Joins this thread to the multithreaded apartment, if it is in none.
+pub fn init_com() {
+    // SAFETY: initialising COM on this thread has no preconditions. It reports
+    // S_FALSE or RPC_E_CHANGED_MODE when COM is already initialised here, and
+    // either way COM is usable, so the result is ignored.
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+}
+
+/// A shell item array of `paths`, in order, as Explorer hands a selection to
+/// a verb. A path may also be a shell namespace name such as `::{CLSID}`.
+pub fn shell_items(paths: &[PathBuf]) -> Result<IShellItemArray> {
+    init_com();
+    let mut lists: Vec<*mut ITEMIDLIST> = Vec::new();
+    let mut parsed = Ok(());
+    for path in paths {
+        let name = HSTRING::from(path.as_os_str());
+        let mut list = std::ptr::null_mut();
+        // SAFETY: the name outlives the call, and `list` receives an ID list
+        // that is freed below.
+        parsed = unsafe { SHParseDisplayName(&name, None, &mut list, 0, None) };
+        if parsed.is_err() {
+            break;
+        }
+        lists.push(list);
+    }
+    let items = parsed.and_then(|()| {
+        let borrowed: Vec<*const ITEMIDLIST> = lists.iter().map(|list| list.cast_const()).collect();
+        // SAFETY: each ID list is a live one made above; the array copies them.
+        unsafe { SHCreateShellItemArrayFromIDLists(&borrowed) }
+    });
+    for list in lists {
+        // SAFETY: SHParseDisplayName allocated the list with the COM
+        // allocator, and nothing uses it after this.
+        unsafe { CoTaskMemFree(Some(list.cast_const().cast())) };
+    }
+    Ok(items?)
+}
+
 /// An instance name no other test, and no viewer the developer is running,
 /// will use.
 pub fn unique_instance() -> String {
@@ -452,10 +494,20 @@ impl HeadlessViewer {
     /// line, used to talk to it. Integration tests pass
     /// `env!("CARGO_BIN_EXE_seerw")` and `env!("CARGO_BIN_EXE_seer")`.
     pub fn start(seerw: &Path, seer: &Path, files: &[&Path]) -> Result<Self> {
+        Self::start_with(seerw, seer, files)
+    }
+
+    /// [`HeadlessViewer::start`] with other arguments in place of the files,
+    /// such as `-Embedding`.
+    pub fn start_with<I, S>(seerw: &Path, seer: &Path, args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let instance = unique_instance();
         let mut process = Command::new(seerw)
             .args(["--headless", "--instance", &instance])
-            .args(files)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -589,10 +641,7 @@ struct Frame<'a> {
 }
 
 fn factory() -> Result<IWICImagingFactory> {
-    // SAFETY: initialising COM on this thread has no preconditions. It reports
-    // S_FALSE or RPC_E_CHANGED_MODE when COM is already initialised here, and
-    // either way COM is usable, so the result is ignored.
-    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    init_com();
     // SAFETY: the class id is a constant and no outer object is given.
     Ok(unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }?)
 }

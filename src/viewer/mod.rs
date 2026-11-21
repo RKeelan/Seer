@@ -1,6 +1,7 @@
 //! The viewer, `seerw.exe`: the window, and the machinery around it.
 //!
 //! - [`args`]: the command line.
+//! - [`execute`]: taking a selection from Explorer through COM.
 //! - [`window`]: the window class and procedure.
 //! - [`note`]: the note field.
 //! - [`theme`]: light and dark.
@@ -17,6 +18,10 @@
 //! The first viewer on an instance takes the instance's mutex. A later one
 //! finds the mutex taken, hands its files to the first over the pipe, asking
 //! it to come to the foreground, and exits.
+//!
+//! A viewer that COM starts with `-Embedding` first takes its files from
+//! Explorer's selection (see [`execute`]), and then goes on as one started
+//! with those files on its command line.
 //!
 //! Start-up is arranged so the first frame appears as soon as possible:
 //!
@@ -42,6 +47,7 @@
 //! the same pixels on every machine.
 
 pub mod args;
+pub mod execute;
 pub mod log;
 pub mod note;
 pub mod theme;
@@ -153,8 +159,11 @@ fn start(args: &RunArgs) -> Result<u8> {
     let mut timings = Timings::start();
     timings.mark("main");
     let instance = InstanceName::from_environment(args.instance.as_deref())?;
-    let files = args
-        .files
+    // Held to the end, so the process outlives Explorer's use of the command.
+    let selection = args.embedding.then(|| delegated(args)).transpose()?;
+    let files = selection
+        .as_ref()
+        .map_or(&args.files, |selection| &selection.files)
         .iter()
         .map(|path| std::path::absolute(path).map_err(Error::from))
         .collect::<Result<Vec<_>>>()?;
@@ -287,6 +296,20 @@ fn start(args: &RunArgs) -> Result<u8> {
     drop(window.take_handler());
     server.stop(REPLY_TIMEOUT);
     Ok(0)
+}
+
+/// Serves the class Explorer executes the open verb through, and returns the
+/// selection it hands over.
+fn delegated(args: &RunArgs) -> Result<execute::Selection> {
+    let clsid = match &args.clsid {
+        Some(text) => execute::parse_clsid(text)?,
+        None => execute::CLSID,
+    };
+    let selection = execute::serve(clsid, execute::SERVE_TIMEOUT)?;
+    if selection.files.is_empty() {
+        return Err(Error::unexpected("the selection holds no files to open"));
+    }
+    Ok(selection)
 }
 
 /// Takes the instance's mutex, or hands the files to the viewer that holds

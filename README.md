@@ -14,6 +14,7 @@ Run `seer install` from wherever `seer.exe` and `seerw.exe` are. It installs See
 
 - It copies both programs to `%LOCALAPPDATA%\Programs\Seer` and adds that directory to your `PATH`, so terminals opened afterwards find `seer`.
 - It registers Seer for the image types it reads, so it appears in Explorer's Open with menu and in Settings > Apps > Default apps. It never makes itself the default: choose it there, or in Open with > Choose another app, for each type you want it to open.
+- It registers the open verb so that Explorer hands a whole selection to one `seerw.exe` through COM, in Explorer's order, and the window selects the first of them. The COM class is a local server in `seerw.exe`, registered for the current user only.
 
 Installing again replaces the programs, even while the viewer is running; the running viewer keeps its old version until it is next started. `seer uninstall` removes the programs, the `PATH` entry and the registrations, and leaves other programs' registrations for the same types alone.
 
@@ -32,7 +33,7 @@ When an open image's file is written, Seer reloads it once the writing stops, ke
 
 ### The command line
 
-There is only ever one viewer window. The first `seerw.exe` to start owns it; any later one hands its files to the first, brings its window to the front, and exits. Many started at once, as when Explorer opens a selection of files, all end up in the one window. `seer.exe` talks to the viewer over a named pipe that only the current user can open and that refuses connections from other machines.
+There is only ever one viewer window. The first `seerw.exe` to start owns it; any later one hands its files to the first, brings its window to the front, and exits. Many started at once all end up in the one window, in the order they reach it. `seer.exe` talks to the viewer over a named pipe that only the current user can open and that refuses connections from other machines.
 
 - `seer open [--group G] [--caption C]… [--compare] [--activate] <files…>` adds images to the window, starting the viewer if none is running, and reports the id given to each. The nth `--caption` belongs to the nth file. Without `--activate` the window does not take the focus: a running viewer flashes its taskbar button, and a new one shows behind the active window.
 - `seer list` reports the open images (id, path, caption, group, size, load state and whether the file is missing), which one is selected, the zoom, the visible region and whether compare view is on. An image not decoded yet, or dropped from memory, is `loading` until it is near the one shown.

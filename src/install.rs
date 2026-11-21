@@ -6,7 +6,11 @@
 //!
 //! - A ProgID per format family, such as `Seer.JPEG`, whose open verb runs
 //!   `"…\seerw.exe" "%1"` with `MultiSelectModel=Player`, so the verb is
-//!   offered for selections of any size.
+//!   offered for selections of any size. The verb's `DelegateExecute` names
+//!   [`CLSID`], so Explorer hands a whole selection, in order, to one
+//!   `seerw.exe` (see [`crate::viewer::execute`]); the command line is for
+//!   programs that read it rather than invoke the verb.
+//! - `CLSID\{…}`, whose `LocalServer32` is `"…\seerw.exe"`.
 //! - The ProgID under each of the family's extensions' `OpenWithProgids`, so
 //!   Seer appears in Open with.
 //! - `Applications\seerw.exe`, with its `SupportedTypes`.
@@ -36,6 +40,7 @@ use windows::core::w;
 
 use crate::error::{Error, Result};
 use crate::registry::{self, Key, Value};
+use crate::viewer::execute::{CLSID, registry_form};
 
 /// The executables that are installed.
 pub const EXECUTABLES: [&str; 2] = ["seer.exe", "seerw.exe"];
@@ -158,6 +163,10 @@ impl Target {
 
     fn capabilities(&self) -> String {
         format!(r"{}\{APPLICATION}\Capabilities", self.software)
+    }
+
+    fn class(&self) -> String {
+        format!(r"{}\CLSID\{}", self.classes(), registry_form(&CLSID))
     }
 
     fn registered_applications(&self) -> String {
@@ -304,14 +313,22 @@ fn register(target: &Target) -> Result<()> {
     let viewer = target.viewer();
     let icon = Value::String(format!("{},0", viewer.display()));
     let command = Value::String(format!("\"{}\" \"%1\"", viewer.display()));
+    let delegate = Value::String(registry_form(&CLSID));
     let classes = target.classes();
+
+    let class = target.class();
+    Key::create(&class)?.set("", &Value::String(format!("{APPLICATION} open verb")))?;
+    Key::create(&format!(r"{class}\LocalServer32"))?
+        .set("", &Value::String(format!("\"{}\"", viewer.display())))?;
 
     // The open verb, as both the ProgIDs and the application key carry it.
     let verb = |key: &str| -> Result<()> {
         Key::create(&format!(r"{key}\DefaultIcon"))?.set("", &icon)?;
         Key::create(&format!(r"{key}\shell\open"))?
             .set("MultiSelectModel", &Value::String("Player".into()))?;
-        Key::create(&format!(r"{key}\shell\open\command"))?.set("", &command)?;
+        let verb_command = Key::create(&format!(r"{key}\shell\open\command"))?;
+        verb_command.set("", &command)?;
+        verb_command.set("DelegateExecute", &delegate)?;
         Ok(())
     };
 
@@ -360,6 +377,8 @@ fn unregister(target: &Target) -> Result<()> {
             registry::delete_empty(&with, software)?;
         }
     }
+    registry::delete_tree(&target.class())?;
+    registry::delete_empty(&format!(r"{classes}\CLSID"), software)?;
     registry::delete_tree(&target.application())?;
     registry::delete_empty(&format!(r"{classes}\Applications"), software)?;
     registry::delete_tree(&target.capabilities())?;
@@ -521,6 +540,7 @@ mod tests {
         let viewer = directory.join("seerw.exe").display().to_string();
         let icon = format!("{:?}", format!("{viewer},0"));
         let command = format!("{:?}", format!("\"{viewer}\" \"%1\""));
+        let delegate = r#""{1F3C3843-28F6-4436-93EE-284B751C1107}""#;
         let mut lines = Vec::new();
         let verb = |key: &str, lines: &mut Vec<String>| {
             lines.push(format!(r"{key}\DefaultIcon"));
@@ -530,9 +550,21 @@ mod tests {
             lines.push(format!(r#"{key}\shell\open : MultiSelectModel = "Player""#));
             lines.push(format!(r"{key}\shell\open\command"));
             lines.push(format!(r"{key}\shell\open\command :  = {command}"));
+            lines.push(format!(
+                r"{key}\shell\open\command : DelegateExecute = {delegate}"
+            ));
         };
         lines.push("Software".to_owned());
         lines.push(r"Software\Classes".to_owned());
+        let class = r"Software\Classes\CLSID\{1F3C3843-28F6-4436-93EE-284B751C1107}";
+        lines.push(r"Software\Classes\CLSID".to_owned());
+        lines.push(class.to_owned());
+        lines.push(format!(r#"{class} :  = "Seer open verb""#));
+        lines.push(format!(r"{class}\LocalServer32"));
+        lines.push(format!(
+            r"{class}\LocalServer32 :  = {:?}",
+            format!("\"{viewer}\"")
+        ));
         lines.push(r"Software\Classes\Applications".to_owned());
         let application = r"Software\Classes\Applications\seerw.exe";
         lines.push(application.to_owned());
