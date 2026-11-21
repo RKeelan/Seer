@@ -26,7 +26,9 @@ Installing again replaces the programs, even while the viewer is running; the ru
 - `seerw --headless` runs the viewer without ever showing its window or taking the focus, for tests. It answers the command line like any viewer, and also accepts `seer debug input`.
 - `--no-activate` shows the window without taking the focus.
 
-The window follows Windows' light or dark setting for apps, title bar included, and switches when the setting changes. A headless viewer is always dark.
+The window follows Windows' light or dark setting for apps, title bar and note field included, and switches when the setting changes. A headless viewer is always dark.
+
+A fitted image stays fitted as the window is resized; otherwise the point at the middle of the window stays there. Moved to a monitor with a different scale, the window keeps its size to the eye and its text and controls scale with it. If the graphics driver restarts or is updated, the viewer moves to a new device and carries on.
 
 Seer reads every still format the Windows Imaging Component can decode: JPEG, PNG, BMP, GIF (the first frame), TIFF, ICO and JPEG XR, plus WebP, HEIC, AVIF and JPEG XL when their codec extensions from the Microsoft Store are installed. An image whose codec is missing shows a message naming the extension to install. EXIF orientation is honoured. Colours are treated as sRGB; embedded colour profiles are ignored.
 
@@ -66,7 +68,7 @@ Two hidden commands exist for testing:
 ### Keys and mouse
 
 - The arrow keys, Page Up and Page Down move to the previous or next image; Home and End move to the first and last.
-- The wheel, a touchpad pinch and `+` and `-` zoom about the pointer (the keys about the middle). `0` fits the image to the window, never enlarging a small one, and `1` shows it at 100%.
+- The wheel (with or without Ctrl), a touchpad pinch, and `+` and `-` zoom about the pointer (the keys about the middle). `0` fits the image to the window, never enlarging a small one, and `1` shows it at 100%. The zoom's percentage shows at the bottom of the image while it changes and fades a second after. From 400% up, pixels are drawn as sharp squares so they can be inspected; below that the image is scaled smoothly.
 - Dragging with the left or middle button pans.
 - `R` turns the view a quarter turn clockwise and Shift+`R` anticlockwise. The file is never changed.
 - Delete or Ctrl+W closes the shown image.

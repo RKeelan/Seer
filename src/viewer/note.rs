@@ -12,11 +12,18 @@
 //! Escape are passed on to the window as key presses, since they finish the
 //! note rather than edit it.
 //!
+//! The control takes the theme's colours, the same as the box the scene
+//! draws around it (see [`note_colours`]), through `WM_CTLCOLOREDIT`, which
+//! the window answers with [`NoteField::paint_colours`].
+//!
 //! [`Effect::ShowNoteField`]: crate::model::app::Effect::ShowNoteField
 //! [`Input::NoteText`]: crate::model::app::Input::NoteText
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, CreateSolidBrush, DeleteObject, HBRUSH, HDC, HFONT, HGDIOBJ,
+    InvalidateRect, SetBkColor, SetTextColor,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{EM_SETCUEBANNER, EM_SETMARGINS, EM_SETSEL};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
@@ -34,8 +41,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 
 use crate::error::Result;
-use crate::model::app::{NOTE_PADDING, NOTE_PROMPT};
+use crate::model::app::{NOTE_PADDING, NOTE_PROMPT, note_colours};
 use crate::model::geometry::Rect;
+use crate::render::scene::Colour;
 
 /// The control's id among the window's children.
 const ID: usize = 1;
@@ -45,19 +53,30 @@ pub struct NoteField {
     hwnd: HWND,
     /// The font, and the DPI it was made for.
     font: Option<(u32, HFONT)>,
+    /// The text's colour.
+    ink: COLORREF,
+    /// The background's colour, and a brush of it.
+    fill: (COLORREF, HBRUSH),
 }
 
 impl NoteField {
-    /// Creates the field, hidden, as a child of `parent`.
+    /// Creates the field, hidden, as a child of `parent`, in the dark theme's
+    /// colours or the light's.
     ///
     /// Windows makes a child window layered only for a program whose
     /// manifest says it supports Windows 8 or later, as Seer's does. Without
     /// one, as in tests, the field is an ordinary child: hidden behind the
     /// window's content, but still taking what the user types, which the
     /// scene shows.
-    pub fn create(parent: HWND) -> Result<Self> {
+    pub fn create(parent: HWND, dark: bool) -> Result<Self> {
         let hwnd = create_edit(parent, true).or_else(|_| create_edit(parent, false))?;
-        let field = NoteField { hwnd, font: None };
+        let mut field = NoteField {
+            hwnd,
+            font: None,
+            ink: COLORREF(0),
+            fill: (COLORREF(0), HBRUSH::default()),
+        };
+        field.set_dark(dark);
         let prompt = HSTRING::from(NOTE_PROMPT);
         // SAFETY: the control is live and the prompt outlives the call, which
         // copies it. A cue banner needs version 6 of the common controls,
@@ -171,6 +190,41 @@ impl NoteField {
         text(self.hwnd)
     }
 
+    /// Gives the field the dark theme's colours or the light's, and redraws
+    /// it.
+    pub fn set_dark(&mut self, dark: bool) {
+        let (fill, ink) = note_colours(dark);
+        let (fill, ink) = (colorref(fill), colorref(ink));
+        if !self.fill.1.is_invalid() && self.fill.0 == fill && self.ink == ink {
+            return;
+        }
+        // SAFETY: CreateSolidBrush takes a plain value.
+        let brush = unsafe { CreateSolidBrush(fill) };
+        let old = std::mem::replace(&mut self.fill, (fill, brush)).1;
+        self.ink = ink;
+        // SAFETY: the old brush, if any, is no longer handed out, and the
+        // control is live; erasing its background repaints it in the new
+        // colours.
+        unsafe {
+            if !old.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(old.0));
+            }
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
+        }
+    }
+
+    /// Sets the colours the control paints its text in on `hdc`, and returns
+    /// the brush for its background, as `WM_CTLCOLOREDIT` asks.
+    pub fn paint_colours(&self, hdc: HDC) -> HBRUSH {
+        // SAFETY: the device context is the one the control is painting
+        // with, valid for the message.
+        unsafe {
+            SetTextColor(hdc, self.ink);
+            SetBkColor(hdc, self.fill.0);
+        }
+        self.fill.1
+    }
+
     /// Sets the font for `dpi`, if it is not set already, and returns the
     /// height of a line of text in it.
     fn font_for(&mut self, dpi: u32) -> f64 {
@@ -228,6 +282,9 @@ impl Drop for NoteField {
             if let Some((_, font)) = self.font.take() {
                 let _ = DeleteObject(HGDIOBJ(font.0));
             }
+            if !self.fill.1.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.fill.1.0));
+            }
         }
     }
 }
@@ -270,6 +327,12 @@ fn create_edit(parent: HWND, layered: bool) -> Result<HWND> {
         }
     }
     Ok(hwnd)
+}
+
+/// A colour as GDI takes it: red in the low byte, then green, then blue.
+fn colorref(colour: Colour) -> COLORREF {
+    let byte = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u32;
+    COLORREF(byte(colour.r) | (byte(colour.g) << 8) | (byte(colour.b) << 16))
 }
 
 /// A window's text, such as an edit control's.
@@ -353,7 +416,7 @@ mod tests {
         // A test program has no manifest, so its children cannot be layered,
         // and the field falls back to an ordinary child.
         assert!(create_edit(window.hwnd(), true).is_err());
-        let mut field = NoteField::create(window.hwnd()).unwrap();
+        let mut field = NoteField::create(window.hwnd(), true).unwrap();
         // SAFETY: GetWindowLongPtrW checks the handle.
         let extended = unsafe { GetWindowLongPtrW(field.hwnd(), GWL_EXSTYLE) };
         assert_eq!(extended as u32 & WS_EX_LAYERED.0, 0);
@@ -396,5 +459,38 @@ mod tests {
             .collect();
         assert_eq!(keys, ["enter", "escape"]);
         assert_eq!(text(HWND::default()), "");
+    }
+
+    #[test]
+    fn the_field_paints_in_the_theme_s_colours() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetBkColor, GetTextColor,
+        };
+
+        let window = Window::create(PixelRect::new(10, 10, 320, 200), "colours").unwrap();
+        let mut field = NoteField::create(window.hwnd(), true).unwrap();
+        // SAFETY: a memory device context compatible with the screen, deleted
+        // below.
+        let hdc = unsafe { CreateCompatibleDC(None) };
+        let colours = |field: &NoteField| {
+            let brush = field.paint_colours(hdc);
+            // SAFETY: the device context is live.
+            unsafe { (GetBkColor(hdc), GetTextColor(hdc), brush) }
+        };
+        let (fill, ink) = note_colours(true);
+        let (background, text, dark_brush) = colours(&field);
+        assert_eq!((background, text), (colorref(fill), colorref(ink)));
+        assert!(!dark_brush.is_invalid());
+        // The same theme again keeps the brush.
+        field.set_dark(true);
+        assert_eq!(colours(&field).2, dark_brush);
+
+        field.set_dark(false);
+        let (fill, ink) = note_colours(false);
+        let (background, text, _) = colours(&field);
+        assert_eq!((background, text), (colorref(fill), colorref(ink)));
+        assert_eq!(background, COLORREF(0x00FF_FFFF));
+        // SAFETY: the device context was made above and is not used again.
+        let _ = unsafe { DeleteDC(hdc) };
     }
 }

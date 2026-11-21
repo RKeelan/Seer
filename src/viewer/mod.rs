@@ -68,6 +68,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::Graphics::Gdi::{HBRUSH, HDC};
 use windows::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -682,7 +683,7 @@ impl Viewer {
     /// unless the viewer is headless.
     fn show_note(&mut self, rect: Rect, text: &str) {
         if self.note.is_none() {
-            self.note = NoteField::create(self.hwnd).ok();
+            self.note = NoteField::create(self.hwnd, self.app.dark()).ok();
         }
         if let Some(note) = &mut self.note
             && note.show(rect, text)
@@ -813,7 +814,11 @@ impl Viewer {
                 .get(&image)
                 .is_none_or(|held| held.width < decoded.bitmap_size.width)
         {
-            match self.graphics.device.create_bitmap(&decoded) {
+            let mut bitmap = self.graphics.device.create_bitmap(&decoded);
+            if bitmap.is_err() && self.graphics.device.is_lost() && self.recover().is_ok() {
+                bitmap = self.graphics.device.create_bitmap(&decoded);
+            }
+            match bitmap {
                 Ok(bitmap) => {
                     self.bitmaps.insert(image, bitmap);
                     self.bitmap_sizes.insert(image, decoded.bitmap_size);
@@ -896,19 +901,24 @@ impl Viewer {
         self.handle(Input::DecodeFailed { image, error });
     }
 
-    /// Draws the frame and presents it.
+    /// Draws the frame and presents it, moving to a new device if the one in
+    /// use has been lost.
     fn present(&mut self) -> Result<()> {
         self.dirty = false;
         let scene = self.app.scene();
         let graphics = &self.graphics;
-        draw(
+        let drawn = draw(
             &graphics.device,
             &graphics.swap_chain,
             &mut self.renderer,
             &scene,
             &self.bitmaps,
             &self.thumbnails,
-        )?;
+        );
+        if drawn.is_err() && self.graphics.device.is_lost() {
+            return self.recover();
+        }
+        drawn?;
         if let Some(image) = self.navigation
             && self.bitmaps.contains_key(&image)
         {
@@ -916,6 +926,40 @@ impl Viewer {
             self.timings.mark("navigation_presented");
         }
         Ok(())
+    }
+
+    /// Moves to a new device of the same kind, as when the one in use has
+    /// been lost, and draws the frame there. Every bitmap was on the lost
+    /// device, so the app is told they are gone and asks again for the
+    /// decodes the shown images and the selection's neighbours need, which
+    /// show as they finish.
+    fn recover(&mut self) -> Result<()> {
+        let device = if self.graphics.device.is_warp() {
+            Device::warp()?
+        } else {
+            Device::new()?
+        };
+        let swap_chain = SwapChain::new(&device, self.graphics.swap_chain.size())?;
+        self.graphics.device = device;
+        self.graphics.swap_chain = swap_chain;
+        self.renderer = Renderer::default();
+        self.bitmaps.clear();
+        self.bitmap_sizes.clear();
+        self.pixels.clear();
+        self.thumbnails.clear();
+        self.thumbnail_pixels.clear();
+        self.handle(Input::DeviceLost);
+        self.dirty = false;
+        let graphics = &self.graphics;
+        draw(
+            &graphics.device,
+            &graphics.swap_chain,
+            &mut self.renderer,
+            &self.app.scene(),
+            &self.bitmaps,
+            &self.thumbnails,
+        )?;
+        self.graphics.composition.show(&self.graphics.swap_chain)
     }
 
     /// Moves to the hardware device, if it is ready: uploads the images,
@@ -1076,7 +1120,15 @@ impl Handler for Viewer {
         }
         let dark = theme::apps_dark();
         theme::set_title_bar(self.hwnd, dark);
+        if let Some(note) = &mut self.note {
+            note.set_dark(dark);
+        }
         self.input(Input::Theme { dark });
+    }
+
+    fn control_colours(&mut self, hdc: HDC, control: HWND) -> Option<HBRUSH> {
+        let note = self.note.as_ref().filter(|note| note.hwnd() == control)?;
+        Some(note.paint_colours(hdc))
     }
 }
 
@@ -1521,6 +1573,14 @@ mod tests {
         let note = viewer.note.as_ref().expect("the field is made");
         assert!(note.is_shown());
         assert_eq!(note.text(), "");
+        // The field paints in the theme's colours, and follows a change to it.
+        let field = note.hwnd();
+        let hdc = HDC::default();
+        assert!(viewer.control_colours(hdc, field).is_some());
+        assert!(viewer.control_colours(hdc, window.hwnd()).is_none());
+        viewer.theme_changed();
+        assert_eq!(viewer.app.dark(), theme::apps_dark());
+        assert!(viewer.control_colours(hdc, field).is_some());
         // Text that arrives as input, as synthetic input does, is echoed in
         // the field.
         viewer.input(Input::NoteText {
@@ -1531,6 +1591,67 @@ mod tests {
         viewer.input(key(Key::Enter));
         assert!(!viewer.note.as_ref().unwrap().is_shown());
         assert_eq!(viewer.app.marks().iter().next().unwrap().note, "typed");
+    }
+
+    #[test]
+    fn a_new_device_takes_over_with_every_image() {
+        let dir = TempDir::new().unwrap();
+        let red = dir.join("red.png");
+        let blue = dir.join("blue.png");
+        write_image(&red, &Pixels::solid(40, 30, Rgba::RED), Format::Png).unwrap();
+        write_image(&blue, &Pixels::solid(40, 30, Rgba::BLUE), Format::Png).unwrap();
+        let window = Window::create(PixelRect::new(0, 0, 200, 160), "recover").unwrap();
+        let (_events, received) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            window.hwnd(),
+            app(&window, true),
+            graphics(&window),
+            Worker::spawn(|| {}),
+            None,
+            Timings::start(),
+            received,
+        );
+        viewer.handle(Input::Request {
+            id: COMMAND_LINE,
+            request: open_request(&[red.clone(), blue], false),
+        });
+        // The neighbour's decode waits for the first frame, as at start-up.
+        viewer.start_prefetching();
+        while viewer.bitmaps.len() < 2 {
+            let output = viewer.worker.recv().unwrap();
+            viewer.accept(output);
+        }
+        assert!(!viewer.graphics.device.is_lost());
+        let colour = |viewer: &Viewer| {
+            let selected = viewer.app.set().selected().unwrap();
+            if viewer.app.set().get(selected).unwrap().path == red {
+                Rgba::RED
+            } else {
+                Rgba::BLUE
+            }
+        };
+        // Every bitmap goes with the old device, and the app asks for the
+        // images again: the shown one and its neighbour.
+        viewer.recover().unwrap();
+        assert!(viewer.graphics.device.is_warp());
+        assert!(viewer.bitmaps.is_empty() && viewer.pixels.is_empty());
+        while viewer.bitmaps.len() < 2 {
+            let output = viewer.worker.recv().unwrap();
+            viewer.accept(output);
+        }
+        let shot = dir.join("shot.png");
+        // The image sits in the middle of the area above the strip.
+        let shown = |viewer: &mut Viewer| {
+            viewer.screenshot(shot.clone()).unwrap();
+            read_image(&shot).unwrap().get(100, 38)
+        };
+        assert_eq!(shown(&mut viewer), colour(&viewer));
+        viewer.input(key(Key::End));
+        viewer.input(key(Key::Left));
+        assert_eq!(shown(&mut viewer), colour(&viewer));
+        viewer.input(key(Key::Right));
+        assert_eq!(shown(&mut viewer), colour(&viewer));
+        viewer.present().unwrap();
     }
 
     #[test]
