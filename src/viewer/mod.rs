@@ -188,7 +188,8 @@ fn start(args: &RunArgs) -> Result<u8> {
         dark,
     };
     let mut app = App::new(config, Box::new(DiskFiles), Instant::now());
-    // The decodes start at once; everything else waits for the window.
+    // The decodes of shown images start at once; everything else, thumbnails
+    // included, waits for the window.
     let mut early = Vec::new();
     if !files.is_empty() {
         let request = open_request(&files, !args.no_activate);
@@ -198,6 +199,10 @@ fn start(args: &RunArgs) -> Result<u8> {
         };
         for effect in app.handle(input, Instant::now()) {
             match effect {
+                Effect::Decode {
+                    target: DecodeTarget::Thumbnail { .. },
+                    ..
+                } => early.push(effect),
                 Effect::Decode {
                     image,
                     path,
@@ -460,9 +465,16 @@ struct Viewer {
     /// The decoded pixels behind `bitmaps`, kept until the move to the
     /// hardware device so they can be uploaded there.
     pixels: HashMap<ImageId, Decoded>,
+    /// Each image's thumbnail, for the strip.
+    thumbnails: Bitmaps,
+    /// The decoded pixels behind `thumbnails`, kept like `pixels`.
+    thumbnail_pixels: HashMap<ImageId, Decoded>,
     /// The images whose decode failed.
     failed: HashSet<ImageId>,
     worker: Worker,
+    /// Decodes thumbnails, on a thread of its own at background priority, so
+    /// a thumbnail never holds up an image to be shown.
+    thumbnailer: Worker,
     upgrade: Option<Upgrade>,
     timings: Timings,
     /// Requests from the pipe server.
@@ -481,8 +493,9 @@ struct Viewer {
     watcher: Watcher,
     /// The changed files waiting to be reloaded.
     reloads: Reloads,
-    /// Decodes ahead of need, held back until the first frame is presented
-    /// so they never slow it; `None` once they go straight to the worker.
+    /// Decodes ahead of need and thumbnails, held back until the first frame
+    /// is presented so they never slow it; `None` once they go straight to
+    /// their workers.
     held: Option<Vec<Job>>,
     /// The image the selection last moved to, until a frame showing it is
     /// presented.
@@ -508,8 +521,11 @@ impl Viewer {
             bitmaps: Bitmaps::new(),
             bitmap_sizes: HashMap::new(),
             pixels: HashMap::new(),
+            thumbnails: Bitmaps::new(),
+            thumbnail_pixels: HashMap::new(),
             failed: HashSet::new(),
             worker,
+            thumbnailer: Worker::spawn_background(move || window::post(posted_to, WM_DECODED)),
             upgrade,
             timings,
             events,
@@ -526,11 +542,20 @@ impl Viewer {
         }
     }
 
-    /// Sends the decodes ahead of need held back for the first frame to the
-    /// worker, and sends later ones straight there.
+    /// Sends the decodes ahead of need and the thumbnails held back for the
+    /// first frame to their workers, and sends later ones straight there.
     fn start_prefetching(&mut self) {
         for job in self.held.take().unwrap_or_default() {
-            self.worker.prefetch(job);
+            self.queue_background(job);
+        }
+    }
+
+    /// Queues a thumbnail on the thumbnailer, or a decode ahead of need on
+    /// the worker.
+    fn queue_background(&self, job: Job) {
+        match job.target {
+            DecodeTarget::Thumbnail { .. } => self.thumbnailer.submit(job),
+            _ => self.worker.prefetch(job),
         }
     }
 
@@ -572,13 +597,9 @@ impl Viewer {
                 Effect::Decode {
                     image,
                     path,
-                    target,
-                } => self.worker.submit(Job {
-                    image,
-                    path,
-                    target,
-                }),
-                Effect::Prefetch {
+                    target: target @ DecodeTarget::Thumbnail { .. },
+                }
+                | Effect::Prefetch {
                     image,
                     path,
                     target,
@@ -590,13 +611,27 @@ impl Viewer {
                     };
                     match &mut self.held {
                         Some(held) => held.push(job),
-                        None => self.worker.prefetch(job),
+                        None => self.queue_background(job),
                     }
                 }
+                Effect::Decode {
+                    image,
+                    path,
+                    target,
+                } => self.worker.submit(Job {
+                    image,
+                    path,
+                    target,
+                }),
+                // A thumbnail stays wanted while its image is open, whatever
+                // happens to the image's own decodes.
                 Effect::CancelDecode { image } => {
                     self.worker.cancel(image);
                     if let Some(held) = &mut self.held {
-                        held.retain(|job| job.image != image);
+                        held.retain(|job| {
+                            job.image != image
+                                || matches!(job.target, DecodeTarget::Thumbnail { .. })
+                        });
                     }
                 }
                 Effect::Evict { image } => {
@@ -604,6 +639,16 @@ impl Viewer {
                     self.bitmap_sizes.remove(&image);
                     self.pixels.remove(&image);
                     self.failed.remove(&image);
+                    // Thumbnails are small enough to keep outside the memory
+                    // budget, so they go only when their image is closed.
+                    if self.app.set().get(image).is_none() {
+                        self.thumbnailer.cancel(image);
+                        if let Some(held) = &mut self.held {
+                            held.retain(|job| job.image != image);
+                        }
+                        self.thumbnails.remove(&image);
+                        self.thumbnail_pixels.remove(&image);
+                    }
                 }
                 Effect::SetCursor { cursor } => self.cursor = cursor,
                 Effect::Activate => match &mut self.visibility {
@@ -675,6 +720,7 @@ impl Viewer {
             &mut self.renderer,
             &self.app.scene(),
             &self.bitmaps,
+            &self.thumbnails,
         )?;
         offscreen::write_png(&path, &capture)?;
         Ok(Reply::Screenshot {
@@ -718,6 +764,9 @@ impl Viewer {
     /// A reload that fails while an older bitmap is held is tried again
     /// later, and the app is not told, so the old image stays on screen.
     fn accept(&mut self, output: Output) {
+        if let DecodeTarget::Thumbnail { .. } = output.target {
+            return self.accept_thumbnail(output);
+        }
         let preview = output.target != DecodeTarget::Full;
         let (started, finished) = if preview {
             ("decode_started", "preview_decoded")
@@ -811,6 +860,34 @@ impl Viewer {
         }
     }
 
+    /// Takes a thumbnail's decode. A thumbnail that cannot be decoded leaves
+    /// its box in the strip empty; the image itself reports why.
+    fn accept_thumbnail(&mut self, output: Output) {
+        let image = output.image;
+        if self.app.set().get(image).is_none() {
+            return;
+        }
+        let Ok(decoded) = output.result else {
+            return;
+        };
+        let Ok(bitmap) = self.graphics.device.create_bitmap(&decoded) else {
+            return;
+        };
+        self.thumbnails.insert(image, bitmap);
+        let size = decoded.size;
+        if self.upgrade.is_some() {
+            self.thumbnail_pixels.insert(image, decoded);
+        }
+        // A thumbnail redecoded after a change on disk has the same shape, so
+        // the scene may not change.
+        self.dirty = true;
+        self.handle(Input::Decoded {
+            image,
+            target: output.target,
+            size,
+        });
+    }
+
     fn failed(&mut self, image: ImageId, error: Error) {
         if self.app.set().selected() == Some(image) {
             self.first_error.get_or_insert(error.clone());
@@ -830,6 +907,7 @@ impl Viewer {
             &mut self.renderer,
             &scene,
             &self.bitmaps,
+            &self.thumbnails,
         )?;
         if let Some(image) = self.navigation
             && self.bitmaps.contains_key(&image)
@@ -856,12 +934,17 @@ impl Viewer {
         };
         drop(upgrade);
         let pixels = std::mem::take(&mut self.pixels);
+        let thumbnail_pixels = std::mem::take(&mut self.thumbnail_pixels);
         self.timings.record("hardware_device_created", ready);
         let device = Device::from_hardware(d3d?)?;
         let swap_chain = SwapChain::new(&device, self.graphics.swap_chain.size())?;
         let mut bitmaps = Bitmaps::new();
         for (image, decoded) in &pixels {
             bitmaps.insert(*image, device.create_bitmap(decoded)?);
+        }
+        let mut thumbnails = Bitmaps::new();
+        for (image, decoded) in &thumbnail_pixels {
+            thumbnails.insert(*image, device.create_bitmap(decoded)?);
         }
         let mut renderer = Renderer::default();
         draw(
@@ -870,12 +953,14 @@ impl Viewer {
             &mut renderer,
             &self.app.scene(),
             &bitmaps,
+            &thumbnails,
         )?;
         self.graphics.composition.show(&swap_chain)?;
         self.graphics.device = device;
         self.graphics.swap_chain = swap_chain;
         self.renderer = renderer;
         self.bitmaps = bitmaps;
+        self.thumbnails = thumbnails;
         self.timings.mark("hardware_shown");
         Ok(())
     }
@@ -889,9 +974,10 @@ fn draw(
     renderer: &mut Renderer,
     scene: &Scene,
     bitmaps: &Bitmaps,
+    thumbnails: &Bitmaps,
 ) -> Result<()> {
     swap_chain.target(device)?;
-    let drawn = renderer.draw(device.context(), scene, bitmaps);
+    let drawn = renderer.draw(device.context(), scene, bitmaps, thumbnails);
     let presented = swap_chain.present(device);
     drawn.and(presented)
 }
@@ -914,6 +1000,9 @@ impl Handler for Viewer {
 
     fn decoded(&mut self) {
         while let Some(output) = self.worker.try_recv() {
+            self.accept(output);
+        }
+        while let Some(output) = self.thumbnailer.try_recv() {
             self.accept(output);
         }
         self.finish();
@@ -1129,8 +1218,9 @@ mod tests {
 
         let input = Request::DebugInput {
             events: vec![
-                serde_json::from_str(r#"{"type":"resize","size":{"width":80,"height":60}}"#)
+                serde_json::from_str(r#"{"type":"resize","size":{"width":80,"height":144}}"#)
                     .unwrap(),
+                serde_json::from_str(r#"{"type":"dpi","dpi":96}"#).unwrap(),
                 serde_json::from_str(r#"{"type":"key","key":"left"}"#).unwrap(),
             ],
         };
@@ -1141,7 +1231,7 @@ mod tests {
             reply,
             Reply::Screenshot {
                 path: shot.clone(),
-                size: PixelSize::new(80, 60)
+                size: PixelSize::new(80, 144)
             }
         );
         assert_eq!(read_image(&shot).unwrap().get(40, 30), Rgba::RED);

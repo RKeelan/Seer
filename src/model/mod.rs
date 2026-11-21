@@ -7,12 +7,14 @@
 //! - [`marks`]: marks in image pixels.
 //! - [`app`]: the state machine that turns [`app::Input`] into state changes
 //!   and [`app::Effect`]s.
+//! - [`strip`]: the thumbnail strip's layout and scrolling.
 //! - [`geometry`]: points, sizes, rectangles, rotations and transforms.
 
 pub mod app;
 pub mod geometry;
 pub mod marks;
 pub mod set;
+pub mod strip;
 pub mod view;
 
 use serde::{Deserialize, Serialize};

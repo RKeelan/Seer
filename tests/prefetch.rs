@@ -54,9 +54,12 @@ fn moving_to_a_neighbour_decoded_ahead_presents_without_a_decode() {
         .collect();
     let files: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
     let viewer = HeadlessViewer::start(Path::new(SEERW), Path::new(SEER), &files).unwrap();
+    // At 100% scale the thumbnail strip takes the bottom 84 rows, leaving
+    // 128 × 96 above it for the image.
+    input(&viewer, r#"{"type":"dpi","dpi":96}"#);
     input(
         &viewer,
-        r#"{"type":"resize","size":{"width":128,"height":96}}"#,
+        r#"{"type":"resize","size":{"width":128,"height":180}}"#,
     );
 
     // The first image and the one after it are decoded; the others wait.

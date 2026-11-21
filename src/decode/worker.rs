@@ -13,6 +13,12 @@
 //! [prefetched](Worker::prefetch) are decodes ahead of need, and run, also in
 //! order, only when no submitted job is waiting. [`Worker::cancel`] drops an
 //! image's queued jobs of either kind; a job already running finishes.
+//!
+//! The viewer decodes thumbnails on a second worker made with
+//! [`Worker::spawn_background`], whose thread Windows runs only when nothing
+//! at normal priority wants the processor or the disk. A thumbnail decode
+//! then never holds up an image to be shown, even one that takes long, such
+//! as a large PNG, which has to be decoded in full to be scaled down.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -20,6 +26,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+};
 
 use crate::decode::wic::{Decoded, Decoder, Source};
 use crate::error::Result;
@@ -142,13 +152,33 @@ pub struct Worker {
 impl Worker {
     /// Starts the thread. It calls `notify` after each output is ready.
     pub fn spawn(notify: impl Fn() + Send + 'static) -> Self {
+        Worker::start(false, notify)
+    }
+
+    /// Starts the thread at background priority, which lowers its priority
+    /// for the processor, the disk and memory. It calls `notify` after each
+    /// output is ready.
+    pub fn spawn_background(notify: impl Fn() + Send + 'static) -> Self {
+        Worker::start(true, notify)
+    }
+
+    fn start(background: bool, notify: impl Fn() + Send + 'static) -> Self {
         let shared = Arc::new(Shared::default());
         let (send, outputs) = mpsc::channel();
         let thread = {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
-                .name("decode".into())
-                .spawn(move || run(&shared, &send, &notify))
+                .name(if background { "thumbnails" } else { "decode" }.into())
+                .spawn(move || {
+                    if background {
+                        // SAFETY: the pseudo-handle names this thread. On
+                        // failure the thread runs at normal priority.
+                        let _ = unsafe {
+                            SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN)
+                        };
+                    }
+                    run(&shared, &send, &notify)
+                })
                 .expect("the decode thread starts")
         };
         Worker {
@@ -281,6 +311,44 @@ mod tests {
         assert!(worker.try_recv().is_none());
         drop(worker);
         assert_eq!(notified.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_slow_thumbnail_does_not_hold_up_an_image_to_be_shown() {
+        let dir = TempDir::new().unwrap();
+        // Noise compresses badly, so this PNG is slow to decode, and a PNG
+        // is decoded in full even for a thumbnail.
+        let large = dir.join("large.png");
+        let noise = Pixels::from_fn(2000, 2000, |x, y| {
+            let n = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503);
+            Rgba::opaque(n as u8, (n >> 8) as u8, (n >> 16) as u8)
+        });
+        write_image(&large, &noise, Format::Png).unwrap();
+        let small = dir.join("small.png");
+        write_image(&small, &Pixels::solid(40, 20, Rgba::BLUE), Format::Png).unwrap();
+
+        let thumbnailer = Worker::spawn_background(|| {});
+        let worker = Worker::spawn(|| {});
+        thumbnailer.submit(Job {
+            image: ImageId(1),
+            path: large,
+            target: DecodeTarget::Thumbnail {
+                at_most: PixelSize::new(64, 48),
+            },
+        });
+        worker.submit(Job {
+            image: ImageId(2),
+            path: small,
+            target: DecodeTarget::Full,
+        });
+        let shown = worker.recv().unwrap();
+        let thumbnail = thumbnailer.recv().unwrap();
+        assert!(shown.result.is_ok());
+        assert_eq!(
+            thumbnail.result.unwrap().bitmap_size,
+            PixelSize::new(48, 48)
+        );
+        assert!(shown.finished < thumbnail.finished);
     }
 
     #[test]

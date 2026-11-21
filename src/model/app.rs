@@ -29,6 +29,7 @@ use crate::error::{Error, ErrorCode};
 use crate::model::geometry::{PixelRect, PixelSize, Point, Rect};
 use crate::model::marks::{Marks, rect_between};
 use crate::model::set::{Files, OpenSet, PathKey, normalise};
+use crate::model::strip::{self, Layout, Strip};
 use crate::model::view::{Frame, View, ZOOM_STEP};
 use crate::model::{ImageId, MarkId};
 use crate::protocol::{
@@ -36,6 +37,7 @@ use crate::protocol::{
     OpenReply, OpenedImage, Reply, Request, Response, ViewInfo,
 };
 use crate::render::scene::{Align, Colour, Interpolation, Item, Scene};
+use crate::render::strip::{Palette, items as strip_items};
 
 /// Identifies a pipe client's request while the viewer answers it, so the
 /// reply reaches the right client. A `marks --wait` request keeps its id until
@@ -535,6 +537,8 @@ const DARK_BACKGROUND: Colour = Colour::rgb(32, 32, 32);
 const DARK_TEXT: Colour = Colour::rgb(230, 230, 230);
 const LIGHT_BACKGROUND: Colour = Colour::rgb(243, 243, 243);
 const LIGHT_TEXT: Colour = Colour::rgb(28, 28, 28);
+const DARK_STRIP: Colour = Colour::rgb(43, 43, 43);
+const LIGHT_STRIP: Colour = Colour::rgb(232, 232, 232);
 const ACCENT: Colour = Colour::rgb(0, 103, 192);
 const WHITE: Colour = Colour::rgb(255, 255, 255);
 const BLACK: Colour = Colour::rgb(0, 0, 0);
@@ -584,6 +588,7 @@ pub struct App {
     pointer: Option<Point>,
     waiters: Vec<Waiter>,
     zoom_changed: Option<Instant>,
+    strip: Strip,
     shown: Shown,
     cache: Cache,
 }
@@ -599,6 +604,9 @@ struct ImageState {
     /// returned, if there is one.
     pending: Option<Priority>,
     view: View,
+    /// The image's full size, once its thumbnail is decoded.
+    thumbnail: Option<PixelSize>,
+    thumbnail_requested: bool,
 }
 
 impl ImageState {
@@ -611,6 +619,8 @@ impl ImageState {
             full_requested,
             pending: None,
             view: View::default(),
+            thumbnail: None,
+            thumbnail_requested: false,
         }
     }
 }
@@ -738,6 +748,7 @@ impl App {
             pointer: None,
             waiters: Vec::new(),
             zoom_changed: None,
+            strip: Strip::default(),
             shown: Shown {
                 title: None,
                 cursor: Cursor::Arrow,
@@ -794,7 +805,7 @@ impl App {
             Input::PointerMove { at, .. } => self.pointer_move(at),
             Input::PointerUp { button, at, .. } => self.pointer_up(button, at),
             Input::DoubleClick { button, at, .. } => self.double_click(button, at),
-            Input::Wheel { at, delta, .. } => self.zoom_at(at, ZOOM_STEP.powf(delta)),
+            Input::Wheel { at, delta, .. } => self.wheel(at, delta),
             Input::Pinch { at, scale } => self.zoom_at(at, scale),
             Input::NoteText { text } => {
                 if let Some(note) = &mut self.note {
@@ -827,6 +838,7 @@ impl App {
                     // the file again, which it does only once the image is
                     // on screen or next to the selection.
                     state.missing = false;
+                    state.thumbnail_requested = false;
                     if state.pending.take().is_some() {
                         effects.push(Effect::CancelDecode { image });
                     }
@@ -953,6 +965,18 @@ impl App {
         });
     }
 
+    /// The wheel scrolls the strip when over it, and zooms elsewhere.
+    fn wheel(&mut self, at: Point, delta: f64) {
+        if let Some(arranged) = self.arranged_strip()
+            && arranged.bounds.contains(at)
+        {
+            let step = strip::THUMBNAIL_WIDTH * self.scale();
+            self.strip.scroll_by(-delta * step, &arranged);
+            return;
+        }
+        self.zoom_at(at, ZOOM_STEP.powf(delta));
+    }
+
     fn zoom_at(&mut self, at: Point, factor: f64) {
         if !factor.is_finite() || factor <= 0.0 {
             return;
@@ -1020,6 +1044,12 @@ impl App {
                 return;
             }
             if self.banner().is_some_and(|banner| banner.contains(at)) {
+                return;
+            }
+            if let Some(image) = self.strip_layout().and_then(|layout| layout.image_at(at)) {
+                self.navigate(|set| {
+                    set.select(image);
+                });
                 return;
             }
             if self.near_divider(at) {
@@ -1535,6 +1565,10 @@ impl App {
         let Some(state) = self.images.get_mut(&image) else {
             return;
         };
+        if let DecodeTarget::Thumbnail { .. } = target {
+            state.thumbnail = Some(size);
+            return;
+        }
         state.size = Some(size);
         state.error = None;
         match target {
@@ -1552,14 +1586,17 @@ impl App {
                     self.cache.hold(image, cache::bitmap_bytes(size, target));
                 }
             }
+            // Taken above.
             DecodeTarget::Thumbnail { .. } => {}
         }
     }
 
     // Keeping the state consistent and telling the window what changed.
 
-    /// Drops state that refers to something no longer shown, and asks for the
-    /// full decode of each shown image that has only a preview.
+    /// Drops state that refers to something no longer shown, asks for the
+    /// full decode of each shown image that has only a preview, scrolls the
+    /// strip to a newly selected image, and asks for the thumbnails the strip
+    /// shows.
     fn tidy(&mut self, effects: &mut Vec<Effect>) {
         if let Some(compare) = &self.compare {
             let group = self.set.selected_entry().and_then(|e| e.group.as_ref());
@@ -1599,6 +1636,7 @@ impl App {
         }
         let shown: Vec<ImageId> = panes.iter().map(|pane| pane.image).collect();
         self.schedule(&shown, effects);
+        self.schedule_strip(effects);
     }
 
     /// Asks for the decodes the images on screen and next to the selection
@@ -1683,6 +1721,28 @@ impl App {
                 target,
             },
         });
+    }
+
+    /// Scrolls the strip to a newly selected image, and asks for the
+    /// thumbnails it shows that have not been asked for.
+    fn schedule_strip(&mut self, effects: &mut Vec<Effect>) {
+        let Some(arranged) = self.arranged_strip() else {
+            return;
+        };
+        self.strip.reveal(self.set.selected(), &arranged);
+        let layout = self.strip.place(arranged);
+        let at_most = layout.thumbnail_size();
+        for cell in layout.visible() {
+            let state = self.images.get_mut(&cell.image).expect("in the set");
+            if !state.thumbnail_requested {
+                state.thumbnail_requested = true;
+                effects.push(Effect::Decode {
+                    image: cell.image,
+                    path: self.set.get(cell.image).expect("in the set").path.clone(),
+                    target: DecodeTarget::Thumbnail { at_most },
+                });
+            }
+        }
     }
 
     fn settle(&mut self, before: &Scene, effects: &mut Vec<Effect>) {
@@ -1820,13 +1880,43 @@ impl App {
         }
     }
 
+    /// The client area above the strip, where images are shown.
     fn area(&self) -> Rect {
+        let strip = if self.strip_shown() {
+            strip::bounds(self.size, self.scale()).height
+        } else {
+            0.0
+        };
         Rect::new(
             0.0,
             0.0,
             f64::from(self.size.width),
-            f64::from(self.size.height),
+            f64::from(self.size.height) - strip,
         )
+    }
+
+    /// The strip shows when there is more than one image to choose from.
+    fn strip_shown(&self) -> bool {
+        self.set.len() > 1
+    }
+
+    /// The strip's layout, unscrolled, if it is shown.
+    fn arranged_strip(&self) -> Option<Layout> {
+        self.strip_shown().then(|| {
+            strip::arrange(
+                self.set
+                    .iter()
+                    .map(|entry| (entry.id, entry.group.as_deref())),
+                strip::bounds(self.size, self.scale()),
+                self.scale(),
+            )
+        })
+    }
+
+    /// The strip's layout as shown, if it is.
+    fn strip_layout(&self) -> Option<Layout> {
+        self.arranged_strip()
+            .map(|arranged| self.strip.place(arranged))
     }
 
     fn panes(&self) -> Vec<Pane> {
@@ -2080,6 +2170,16 @@ impl App {
                 align: Align::Centre,
                 bold: false,
             });
+        }
+
+        if let Some(layout) = self.strip_layout() {
+            let palette = Palette {
+                background: if self.dark { DARK_STRIP } else { LIGHT_STRIP },
+                text,
+                accent: ACCENT,
+            };
+            let thumbnail = |image| self.images[&image].thumbnail;
+            strip_items(&layout, self.set.selected(), thumbnail, palette, &mut items);
         }
 
         if let (Some(field), Some(note)) = (self.note_field(), &self.note) {
@@ -2439,6 +2539,8 @@ mod session_tests {
     }
 
     const WINDOW: PixelSize = PixelSize::new(800, 600);
+    /// A window whose area above the thumbnail strip is [`WINDOW`].
+    const TALL: PixelSize = PixelSize::new(800, 684);
 
     struct Session {
         app: App,
@@ -2451,6 +2553,16 @@ mod session_tests {
             Session::with(Config {
                 headless: true,
                 size: WINDOW,
+                dpi: 96,
+                dark: true,
+            })
+        }
+
+        /// A session in a [`TALL`] window, for tests with several images.
+        fn tall() -> Self {
+            Session::with(Config {
+                headless: true,
+                size: TALL,
                 dpi: 96,
                 dark: true,
             })
@@ -2672,7 +2784,7 @@ mod session_tests {
     }
 
     fn three_images() -> Session {
-        let mut session = Session::new();
+        let mut session = Session::tall();
         session.open(&[
             r"C:\shots\one.png",
             r"C:\shots\two.png",
@@ -2687,7 +2799,7 @@ mod session_tests {
     #[test]
     fn a_whole_session() {
         let mut session = Session::new();
-        let effects = session.send(Input::Resize { size: WINDOW });
+        let effects = session.send(Input::Resize { size: TALL });
         assert_eq!(title(&effects), Some("Seer"));
         assert_eq!(texts(&session.app.scene()), ["No images open"]);
 
@@ -2927,7 +3039,8 @@ mod session_tests {
     }
 
     /// The decodes asked for, as (image, target, whether ahead of need),
-    /// and the images whose decodes were cancelled and bitmaps evicted.
+    /// leaving out thumbnails, and the images whose decodes were cancelled
+    /// and bitmaps evicted.
     #[derive(Debug, Default, PartialEq)]
     struct Decodes {
         asked: Vec<(u32, DecodeTarget, bool)>,
@@ -2939,6 +3052,10 @@ mod session_tests {
         let mut decodes = Decodes::default();
         for effect in effects {
             match effect {
+                Effect::Decode {
+                    target: DecodeTarget::Thumbnail { .. },
+                    ..
+                } => {}
                 Effect::Decode { image, target, .. } => {
                     decodes.asked.push((image.0, *target, false));
                 }
@@ -3767,7 +3884,7 @@ mod session_tests {
 
     #[test]
     fn compare_tiles_a_group_with_one_shared_view() {
-        let mut session = Session::new();
+        let mut session = Session::tall();
         session.open(&[r"C:\solo.png"]);
         session.open_with(&[r"C:\before.png", r"C:\after.png"], Some("fix"), false);
         session.decode(1, 800, 600);
@@ -3827,7 +3944,7 @@ mod session_tests {
 
     #[test]
     fn compare_tiles_four_up_in_a_grid() {
-        let mut session = Session::new();
+        let mut session = Session::tall();
         let paths = [r"C:\1.png", r"C:\2.png", r"C:\3.png", r"C:\4.png"];
         session.open_with(&paths, Some("many"), true);
         let effects = session.decode(1, 10, 10);
@@ -3872,7 +3989,7 @@ mod session_tests {
 
     #[test]
     fn compare_split_divides_two_images_with_a_draggable_line() {
-        let mut session = Session::new();
+        let mut session = Session::tall();
         session.request(Request::Open {
             files: vec![
                 OpenFile {
@@ -4023,6 +4140,132 @@ mod session_tests {
         assert!(effects.contains(&Effect::ReportTimings { id }));
     }
 
+    /// The images whose thumbnails `effects` ask for, at the strip's size at
+    /// 100% scale.
+    fn thumbnails_asked(effects: &[Effect]) -> Vec<u32> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Decode {
+                    image,
+                    target: DecodeTarget::Thumbnail { at_most },
+                    ..
+                } => {
+                    assert_eq!(*at_most, PixelSize::new(64, 48));
+                    Some(image.0)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn thumbnails_drawn(scene: &Scene) -> Vec<(u32, Rect)> {
+        scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Thumbnail { image, rect } => Some((image.0, *rect)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_strip_shows_thumbnails_of_two_or_more_images() {
+        let mut session = Session::new();
+        let (_, effects) = session.open_with(&[r"C:\one.png"], None, false);
+        assert!(thumbnails_asked(&effects).is_empty());
+        session.decode(1, 800, 600);
+        assert_eq!(
+            images(&session.app.scene()),
+            [(1, Rect::new(0.0, 0.0, 800.0, 600.0))]
+        );
+
+        // A second image brings the strip, and asks for both thumbnails.
+        let (_, effects) = session.open_with(&[r"C:\two.png"], Some("pair"), false);
+        assert_eq!(thumbnails_asked(&effects), [1, 2]);
+        session.key(Key::Left);
+        let scene = session.app.scene();
+        assert_eq!(images(&scene), [(1, Rect::new(0.0, 0.0, 800.0, 516.0))]);
+        assert!(thumbnails_drawn(&scene).is_empty());
+        assert!(texts(&scene).contains(&"pair".to_string()));
+        // The selected thumbnail's box is outlined.
+        assert!(
+            strokes(&scene).contains(&(Rect::new(6.0, 538.0, 68.0, 52.0), false)),
+            "{:?}",
+            strokes(&scene)
+        );
+
+        // A decoded thumbnail is drawn fitted in its box, and the shown image
+        // is unaffected.
+        let effects = session.send(Input::Decoded {
+            image: ImageId(2),
+            target: DecodeTarget::Thumbnail {
+                at_most: PixelSize::new(64, 48),
+            },
+            size: PixelSize::new(1000, 250),
+        });
+        assert!(effects.contains(&Effect::Redraw));
+        assert_eq!(
+            thumbnails_drawn(&session.app.scene()),
+            [(2, Rect::new(84.0, 556.0, 64.0, 16.0))]
+        );
+        assert_eq!(session.list().images[1].size, None);
+
+        // A thumbnail is asked for once, and again when its file changes.
+        assert!(thumbnails_asked(&session.key(Key::Right)).is_empty());
+        assert_eq!(session.selected(), Some(2));
+        let effects = session.send(Input::FileChanged { image: ImageId(2) });
+        assert_eq!(thumbnails_asked(&effects), [2]);
+
+        // Closing down to one image hides the strip.
+        session.key_with(Key::Char('w'), Modifiers::CTRL);
+        let scene = session.app.scene();
+        assert!(thumbnails_drawn(&scene).is_empty());
+        assert_eq!(images(&scene), [(1, Rect::new(0.0, 0.0, 800.0, 600.0))]);
+    }
+
+    #[test]
+    fn the_strip_follows_the_selection_scrolls_and_selects_on_a_click() {
+        let mut session = Session::new();
+        let paths: Vec<String> = (1..=30).map(|n| format!(r"C:\{n}.png")).collect();
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let (_, effects) = session.open_with(&paths, None, false);
+        // 800 pixels show eleven thumbnails of 64 with gaps of 8.
+        let first: Vec<u32> = (1..=11).collect();
+        assert_eq!(thumbnails_asked(&effects), first);
+
+        // Going to the end scrolls the strip there, and asks for what it
+        // brings into view.
+        let effects = session.key(Key::End);
+        let last: Vec<u32> = (20..=30).collect();
+        assert_eq!(thumbnails_asked(&effects), last);
+
+        // Clicking a thumbnail selects its image.
+        let layout = session.app.strip_layout().unwrap();
+        let cell = layout.cells[24].rect;
+        session.down(Button::Left, cell.x + 1.0, cell.y + 1.0);
+        session.up(Button::Left, cell.x + 1.0, cell.y + 1.0);
+        assert_eq!(session.selected(), Some(25));
+        assert_eq!(session.app.strip_layout(), Some(layout));
+        session.decode(25, 800, 600);
+
+        // The wheel over the strip scrolls it rather than zooming.
+        let zoom = session.view().zoom;
+        let effects = session.send(Input::Wheel {
+            at: Point::new(400.0, 560.0),
+            delta: 3.0,
+            modifiers: Modifiers::NONE,
+        });
+        assert_eq!(thumbnails_asked(&effects), [17, 18, 19]);
+        assert_eq!(session.view().zoom, zoom);
+        // A click between thumbnails does nothing.
+        let layout = session.app.strip_layout().unwrap();
+        let gap = layout.cells[20].rect.right() + 4.0;
+        session.down(Button::Left, gap, 560.0);
+        assert_eq!(session.selected(), Some(25));
+    }
+
     #[test]
     fn window_changes_redraw() {
         let mut session = three_images();
@@ -4032,14 +4275,19 @@ mod session_tests {
                 .contains(&Effect::Redraw)
         );
         assert_eq!(session.app.scene().background, LIGHT_BACKGROUND);
-        assert!(session.send(Input::Dpi { dpi: 192 }).is_empty());
+        // The strip grows with the scale.
+        assert!(
+            session
+                .send(Input::Dpi { dpi: 192 })
+                .contains(&Effect::Redraw)
+        );
         session.mark((100.0, 100.0), (300.0, 200.0), "scaled");
         let effects = session.send(Input::Resize {
-            size: PixelSize::new(1600, 1200),
+            size: PixelSize::new(1600, 1200 + 168),
         });
         assert!(effects.contains(&Effect::Redraw));
         assert_eq!(session.view().zoom, 1.0);
-        assert_eq!(session.app.scene().size, PixelSize::new(1600, 1200));
+        assert_eq!(session.app.scene().size, PixelSize::new(1600, 1368));
         // Earlier times than the last are treated as the last.
         let earlier = session.now - Duration::from_secs(1);
         session.app.handle(Input::Tick, earlier);
