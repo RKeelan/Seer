@@ -259,10 +259,11 @@ pub struct ImageInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadState {
-    /// Nothing is decoded yet.
+    /// Nothing is decoded: the image is not decoded yet, or was dropped from
+    /// memory. It is decoded when it is shown or next to the image shown.
     Loading,
-    /// A version scaled to the window is shown; the full-resolution decode is
-    /// still to come.
+    /// A version scaled to the window, or the image as it was before its file
+    /// changed, is shown; the full-resolution decode is still to come.
     Preview,
     /// Decoded at full resolution.
     Loaded,

@@ -216,7 +216,10 @@ fn images_are_closed_and_groups_cleared() {
         &paths[2],
         &paths[3],
     ]);
-    let list = viewer.wait_until_loaded(4);
+    // Each open answers once its images are in the set. Only the selection
+    // and its neighbours are sure to be decoded, and nothing here needs them.
+    let list = viewer.list();
+    assert_eq!(list.images.len(), 4);
     let all = ids(&list);
 
     let closed: Reply = viewer.seer_json([Path::new("close"), &paths[0]]);
@@ -329,22 +332,51 @@ fn twenty_viewers_started_at_once_make_one_window_with_twenty_images() {
             .output()
             .unwrap()
     };
+    // Each hand-over selects its image, so only the last selection and its
+    // neighbours are sure to be decoded: an image whose queued decode is
+    // overtaken by two more arrivals waits until the selection nears it.
     let deadline = Instant::now() + VIEWER_TIMEOUT;
-    let list = loop {
+    let wait_for = |done: &dyn Fn(&ListReply) -> bool| loop {
         let list: ListReply = serde_json::from_slice(&seer(&["list"]).stdout).unwrap();
-        if list.images.len() == 20
-            && list
-                .images
-                .iter()
-                .all(|image| image.state == LoadState::Loaded)
-        {
+        if done(&list) {
             break list;
         }
         assert!(Instant::now() < deadline, "the set is {list:?}");
         std::thread::sleep(Duration::from_millis(20));
     };
+    let list = wait_for(&|list| {
+        let Some(selected) = list
+            .selected
+            .and_then(|id| list.images.iter().position(|image| image.id == id))
+        else {
+            return false;
+        };
+        let near = selected.saturating_sub(1)..(selected + 2).min(list.images.len());
+        list.images.len() == 20
+            && list.images[near]
+                .iter()
+                .all(|image| image.state == LoadState::Loaded)
+    });
+    assert!(
+        list.images
+            .iter()
+            .all(|image| image.state != LoadState::Failed),
+        "the set is {list:?}"
+    );
     let opened: BTreeSet<PathBuf> = list.images.into_iter().map(|image| image.path).collect();
     assert_eq!(opened, paths.into_iter().collect());
+
+    // Any image left behind is decoded once the selection reaches it.
+    assert!(
+        seer(&["debug", "input", r#"{"type":"key","key":"home"}"#])
+            .status
+            .success()
+    );
+    wait_for(&|list| {
+        list.images[..2]
+            .iter()
+            .all(|image| image.state == LoadState::Loaded)
+    });
 
     assert!(seer(&["quit"]).status.success());
     assert!(owner.wait().unwrap().success());

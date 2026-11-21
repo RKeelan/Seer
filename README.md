@@ -19,6 +19,7 @@ Installing again replaces the programs, even while the viewer is running; the ru
 
 - `seer --version` and `seerw --version` print the program's name and version.
 - `seerw <files…>` opens a window showing the first image, fitted to the window and never enlarged, with the others a key press away. A large image appears at window size first and sharpens once its full-resolution decode finishes. The title bar shows the image's file name and size in pixels.
+- While an image is shown, the images either side of it are decoded in the background, so moving to one shows it at once. Decoded images are kept in memory up to a quarter of the machine's memory, at most 2 GB; beyond that, those shown longest ago are dropped and decoded again when needed. Images further away are not decoded until they are near the one shown.
 - `seerw` with no files starts the viewer empty. It shows its window once it has been sent an image and drawn it, or after a second with nothing to show.
 - `seerw --headless` runs the viewer without ever showing its window or taking the focus, for tests. It answers the command line like any viewer, and also accepts `seer debug input`.
 - `--no-activate` shows the window without taking the focus.
@@ -27,14 +28,14 @@ The window follows Windows' light or dark setting for apps, title bar included, 
 
 Seer reads every still format the Windows Imaging Component can decode: JPEG, PNG, BMP, GIF (the first frame), TIFF, ICO and JPEG XR, plus WebP, HEIC, AVIF and JPEG XL when their codec extensions from the Microsoft Store are installed. An image whose codec is missing shows a message naming the extension to install. EXIF orientation is honoured. Colours are treated as sRGB; embedded colour profiles are ignored.
 
-When an open image's file is written, Seer reloads it once the writing stops, keeping the zoom, position, rotation and marks; if the size changed, the same relative point stays in the middle. A file that is locked or only partly written is tried again after a short wait, and the old image stays on screen meanwhile. A deleted file stays open showing its last image, and `seer list` reports it as missing. Seer closes each file once it has read it, so it never stops another program from writing or deleting it, and it watches only the open files, through change notifications on their folders; it never lists a folder.
+When an open image's file is written, Seer reloads it once the writing stops, keeping the zoom, position, rotation and marks; if the size changed, the same relative point stays in the middle. A file that is locked or only partly written is tried again after a short wait, and the old image stays on screen meanwhile. Until the new file is decoded, `seer list` reports the image as `preview`. An image that is neither shown nor next to the one shown is reloaded only once it is. A deleted file stays open showing its last image, and `seer list` reports it as missing. Seer closes each file once it has read it, so it never stops another program from writing or deleting it, and it watches only the open files, through change notifications on their folders; it never lists a folder.
 
 ### The command line
 
 There is only ever one viewer window. The first `seerw.exe` to start owns it; any later one hands its files to the first, brings its window to the front, and exits. Many started at once, as when Explorer opens a selection of files, all end up in the one window. `seer.exe` talks to the viewer over a named pipe that only the current user can open and that refuses connections from other machines.
 
 - `seer open [--group G] [--caption C]… [--compare] [--activate] <files…>` adds images to the window, starting the viewer if none is running, and reports the id given to each. The nth `--caption` belongs to the nth file. Without `--activate` the window does not take the focus: a running viewer flashes its taskbar button, and a new one shows behind the active window.
-- `seer list` reports the open images (id, path, caption, group, size, load state and whether the file is missing), which one is selected, the zoom, the visible region and whether compare view is on.
+- `seer list` reports the open images (id, path, caption, group, size, load state and whether the file is missing), which one is selected, the zoom, the visible region and whether compare view is on. An image not decoded yet, or dropped from memory, is `loading` until it is near the one shown.
 - `seer close <id or path>…` removes images, and `seer close --all` removes them all. A bare number is an id; write `.\3` for a file named `3`. Naming an image that is not open is not an error: it is reported on stderr and in the JSON's `not_found`.
 - `seer clear <group>` removes a group's images.
 - `seer marks [--wait] [--timeout <seconds>] [--clear]` reports the marks the user has drawn: for each, its id, its image's id and path, its rectangle (`x`, `y`, `width`, `height` in the image's own pixels, whatever the zoom and rotation) and its note, in the order of the images and then the order the marks were made. `--wait` answers only once the user presses Ctrl+Enter, `--timeout` gives up after that many seconds (which may be fractional) with exit code 5, and `--clear` removes the marks once reported.
@@ -58,7 +59,7 @@ Exit codes:
 Two hidden commands exist for testing:
 
 - `seer debug input <event>…` feeds synthetic input to a viewer started with `seerw --headless`. Each argument is a JSON event or array of events, such as `{"type":"key","key":"right"}` or `{"type":"pointer_down","button":"right","at":{"x":120,"y":80}}`; an argument of `-` reads events from stdin, one JSON value per line.
-- `seer debug timings` reports the viewer's start-up timings in milliseconds from process creation.
+- `seer debug timings` reports the viewer's start-up timings in milliseconds from process creation. It also times the latest move to another image: `navigated` when the selection moved, `navigation_presented` when a frame showing the image was presented, and `navigation_decoded` when the decode that frame waited for finished, which is absent when the image had been decoded ahead.
 
 ### Keys and mouse
 

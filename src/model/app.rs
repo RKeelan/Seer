@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::decode::cache::{self, Cache};
 use crate::error::{Error, ErrorCode};
 use crate::model::geometry::{PixelRect, PixelSize, Point, Rect};
 use crate::model::marks::{Marks, rect_between};
@@ -228,8 +229,25 @@ pub enum Effect {
         /// What to decode.
         target: DecodeTarget,
     },
-    /// Drop any queued or running decode of an image.
+    /// Decode an image ahead of need, once nothing asked for by
+    /// [`Effect::Decode`] is waiting. The result arrives as for `Decode`.
+    Prefetch {
+        /// The image.
+        image: ImageId,
+        /// The image's file.
+        path: PathBuf,
+        /// What to decode.
+        target: DecodeTarget,
+    },
+    /// Drop the queued decodes of an image. One already running still
+    /// reports its result.
     CancelDecode {
+        /// The image.
+        image: ImageId,
+    },
+    /// Drop an image's decoded bitmap, to stay within the memory budget or
+    /// because the image was closed.
+    Evict {
         /// The image.
         image: ImageId,
     },
@@ -567,6 +585,7 @@ pub struct App {
     waiters: Vec<Waiter>,
     zoom_changed: Option<Instant>,
     shown: Shown,
+    cache: Cache,
 }
 
 /// What the model knows about an image beyond its place in the set.
@@ -576,6 +595,9 @@ struct ImageState {
     error: Option<Error>,
     missing: bool,
     full_requested: bool,
+    /// The priority of the decode asked for by [`App::schedule`] and not yet
+    /// returned, if there is one.
+    pending: Option<Priority>,
     view: View,
 }
 
@@ -587,9 +609,19 @@ impl ImageState {
             error: None,
             missing: false,
             full_requested,
+            pending: None,
             view: View::default(),
         }
     }
+}
+
+/// Why an image is decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Priority {
+    /// It is on screen: [`Effect::Decode`].
+    Shown,
+    /// It is next to the selection: [`Effect::Prefetch`].
+    Ahead,
 }
 
 /// Compare view: a group's images shown together with one shared view.
@@ -712,7 +744,14 @@ impl App {
                 note_field: None,
                 wake_at: None,
             },
+            cache: Cache::new(cache::MAX_BUDGET),
         }
+    }
+
+    /// Sets the most memory, in bytes, that decoded images may take.
+    /// [`cache::budget`] gives the usual figure for the machine.
+    pub fn set_cache_budget(&mut self, bytes: u64) {
+        self.cache.set_budget(bytes);
     }
 
     /// Acts on an input that arrived at `now`, and returns what the window
@@ -778,27 +817,25 @@ impl App {
                 if let Some(state) = self.images.get_mut(&image) {
                     state.state = LoadState::Failed;
                     state.error = Some(error);
+                    state.pending = None;
                 }
             }
             Input::FileChanged { image } => {
-                let shown = self.panes().iter().any(|pane| pane.image == image);
-                if let (Some(entry), Some(state)) =
-                    (self.set.get(image), self.images.get_mut(&image))
-                {
+                if let Some(state) = self.images.get_mut(&image) {
+                    // Decodes of the old file no longer count. Any old pixels
+                    // stand in, as a preview does, until `schedule` asks for
+                    // the file again, which it does only once the image is
+                    // on screen or next to the selection.
                     state.missing = false;
-                    if !shown && state.state == LoadState::Loaded {
-                        // Decoded again when next shown; until then the old
-                        // pixels stand in, as a preview does.
-                        state.state = LoadState::Preview;
-                        state.full_requested = false;
-                    } else {
-                        state.full_requested = true;
-                        effects.push(Effect::Decode {
-                            image,
-                            path: entry.path.clone(),
-                            target: DecodeTarget::Full,
-                        });
+                    if state.pending.take().is_some() {
+                        effects.push(Effect::CancelDecode { image });
                     }
+                    state.full_requested = false;
+                    state.error = None;
+                    state.state = match state.state {
+                        LoadState::Loaded | LoadState::Preview => LoadState::Preview,
+                        LoadState::Loading | LoadState::Failed => LoadState::Loading,
+                    };
                 }
             }
             Input::FileMissing { image } => {
@@ -1370,30 +1407,20 @@ impl App {
                 file.caption,
                 group.clone(),
             );
+            // The image is decoded when it is shown or next to the selection;
+            // see `schedule`.
             let retry = existing && self.images[&id].state == LoadState::Failed;
-            if !existing || retry {
-                let target = if self.size.width == 0 || self.size.height == 0 {
-                    DecodeTarget::Full
-                } else {
-                    DecodeTarget::Fit { within: self.size }
-                };
-                let state = ImageState::new(target == DecodeTarget::Full);
-                if retry {
-                    let old = self.images.get_mut(&id).expect("in the set");
-                    old.state = state.state;
-                    old.error = None;
-                    old.full_requested = state.full_requested;
-                } else {
-                    self.images.insert(id, state);
-                    effects.push(Effect::Watch {
-                        image: id,
-                        path: file.path.clone(),
-                    });
-                }
-                effects.push(Effect::Decode {
+            if retry {
+                let old = self.images.get_mut(&id).expect("in the set");
+                old.state = LoadState::Loading;
+                old.error = None;
+                old.full_requested = false;
+                old.pending = None;
+            } else if !existing {
+                self.images.insert(id, ImageState::new(false));
+                effects.push(Effect::Watch {
                     image: id,
                     path: file.path.clone(),
-                    target,
                 });
             }
             images.push(OpenedImage {
@@ -1497,7 +1524,9 @@ impl App {
         if self.set.remove(id).is_some() {
             self.images.remove(&id);
             self.marks.remove_image(id);
+            self.cache.forget(id);
             effects.push(Effect::CancelDecode { image: id });
+            effects.push(Effect::Evict { image: id });
             effects.push(Effect::Unwatch { image: id });
         }
     }
@@ -1509,10 +1538,18 @@ impl App {
         state.size = Some(size);
         state.error = None;
         match target {
-            DecodeTarget::Full => state.state = LoadState::Loaded,
+            DecodeTarget::Full => {
+                state.state = LoadState::Loaded;
+                state.pending = None;
+                self.cache.hold(image, cache::bitmap_bytes(size, target));
+            }
             DecodeTarget::Scaled { .. } | DecodeTarget::Fit { .. } => {
                 if state.state != LoadState::Loaded {
+                    if state.state != LoadState::Preview {
+                        state.pending = None;
+                    }
                     state.state = LoadState::Preview;
+                    self.cache.hold(image, cache::bitmap_bytes(size, target));
                 }
             }
             DecodeTarget::Thumbnail { .. } => {}
@@ -1560,17 +1597,92 @@ impl App {
         {
             self.zoom_changed = None;
         }
-        for pane in &panes {
-            let state = self.images.get_mut(&pane.image).expect("in the set");
-            if state.state == LoadState::Preview && !state.full_requested {
-                state.full_requested = true;
-                effects.push(Effect::Decode {
-                    image: pane.image,
-                    path: self.set.get(pane.image).expect("shown").path.clone(),
-                    target: DecodeTarget::Full,
-                });
+        let shown: Vec<ImageId> = panes.iter().map(|pane| pane.image).collect();
+        self.schedule(&shown, effects);
+    }
+
+    /// Asks for the decodes the images on screen and next to the selection
+    /// need, cancels those no longer needed, and evicts what the memory
+    /// budget cannot hold.
+    ///
+    /// An image on screen is decoded at window size first, then in full. Its
+    /// neighbours in the set are decoded the same way, ahead of need, at a
+    /// lower priority.
+    fn schedule(&mut self, shown: &[ImageId], effects: &mut Vec<Effect>) {
+        let order: Vec<ImageId> = self.set.iter().map(|entry| entry.id).collect();
+        let ahead: Vec<ImageId> = self
+            .set
+            .selected()
+            .map(|selected| cache::neighbours(&order, selected))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|image| !shown.contains(image))
+            .collect();
+        for image in &order {
+            let state = self.images.get_mut(image).expect("in the set");
+            if state.pending.is_some() && !shown.contains(image) && !ahead.contains(image) {
+                state.pending = None;
+                state.full_requested = false;
+                effects.push(Effect::CancelDecode { image: *image });
             }
         }
+        let wanted = shown
+            .iter()
+            .map(|&image| (image, Priority::Shown))
+            .chain(ahead.iter().map(|&image| (image, Priority::Ahead)));
+        for (image, priority) in wanted {
+            self.ask_decode(image, priority, effects);
+        }
+        self.cache.show(shown);
+        let keep: Vec<ImageId> = shown.iter().chain(&ahead).copied().collect();
+        for image in self.cache.evict(&keep) {
+            let state = self.images.get_mut(&image).expect("in the set");
+            state.state = LoadState::Loading;
+            state.full_requested = false;
+            state.pending = None;
+            effects.push(Effect::Evict { image });
+        }
+    }
+
+    /// Asks for the next decode `image` needs, at `priority`. A decode asked
+    /// for ahead of need is asked for again at once if the image is now on
+    /// screen.
+    fn ask_decode(&mut self, image: ImageId, priority: Priority, effects: &mut Vec<Effect>) {
+        let empty = self.size.width == 0 || self.size.height == 0;
+        let state = self.images.get_mut(&image).expect("in the set");
+        let target = match state.state {
+            LoadState::Loading if empty => DecodeTarget::Full,
+            LoadState::Loading => DecodeTarget::Fit { within: self.size },
+            LoadState::Preview => DecodeTarget::Full,
+            LoadState::Loaded | LoadState::Failed => return,
+        };
+        let asked = match state.state {
+            LoadState::Loading => state.pending.is_some(),
+            _ => state.full_requested,
+        };
+        if asked {
+            if !(state.pending == Some(Priority::Ahead) && priority == Priority::Shown) {
+                return;
+            }
+            effects.push(Effect::CancelDecode { image });
+        }
+        state.pending = Some(priority);
+        if target == DecodeTarget::Full {
+            state.full_requested = true;
+        }
+        let path = self.set.get(image).expect("in the set").path.clone();
+        effects.push(match priority {
+            Priority::Shown => Effect::Decode {
+                image,
+                path,
+                target,
+            },
+            Priority::Ahead => Effect::Prefetch {
+                image,
+                path,
+                target,
+            },
+        });
     }
 
     fn settle(&mut self, before: &Scene, effects: &mut Vec<Effect>) {
@@ -2814,6 +2926,135 @@ mod session_tests {
         session.send(Input::FileMissing { image: ImageId(9) });
     }
 
+    /// The decodes asked for, as (image, target, whether ahead of need),
+    /// and the images whose decodes were cancelled and bitmaps evicted.
+    #[derive(Debug, Default, PartialEq)]
+    struct Decodes {
+        asked: Vec<(u32, DecodeTarget, bool)>,
+        cancelled: Vec<u32>,
+        evicted: Vec<u32>,
+    }
+
+    fn decodes(effects: &[Effect]) -> Decodes {
+        let mut decodes = Decodes::default();
+        for effect in effects {
+            match effect {
+                Effect::Decode { image, target, .. } => {
+                    decodes.asked.push((image.0, *target, false));
+                }
+                Effect::Prefetch { image, target, .. } => {
+                    decodes.asked.push((image.0, *target, true));
+                }
+                Effect::CancelDecode { image } => decodes.cancelled.push(image.0),
+                Effect::Evict { image } => decodes.evicted.push(image.0),
+                _ => {}
+            }
+        }
+        decodes
+    }
+
+    fn states(session: &mut Session) -> Vec<LoadState> {
+        session
+            .list()
+            .images
+            .iter()
+            .map(|image| image.state)
+            .collect()
+    }
+
+    #[test]
+    fn the_shown_image_is_decoded_first_and_its_neighbours_ahead() {
+        let mut session = Session::new();
+        let fit = DecodeTarget::Fit { within: WINDOW };
+        let full = DecodeTarget::Full;
+        let paths = [r"C:\1.png", r"C:\2.png", r"C:\3.png", r"C:\4.png"];
+        let (_, effects) = session.open_with(&paths, None, false);
+        assert_eq!(
+            decodes(&effects).asked,
+            [(1, fit, false), (2, fit, true)],
+            "only the shown image and its neighbour"
+        );
+
+        // A neighbour's preview is followed by its full decode, still ahead
+        // of need.
+        let effects = session.send(Input::Decoded {
+            image: ImageId(2),
+            target: fit,
+            size: PixelSize::new(1600, 1200),
+        });
+        assert_eq!(decodes(&effects).asked, [(2, full, true)]);
+        // Nothing is asked for twice.
+        assert_eq!(decodes(&session.key(Key::Char('1'))), Decodes::default());
+
+        // Moving to it asks for its full decode at once in place of the
+        // queued one, and decodes the next neighbour ahead.
+        let effects = session.key(Key::Right);
+        assert_eq!(
+            decodes(&effects),
+            Decodes {
+                asked: vec![(2, full, false), (3, fit, true)],
+                cancelled: vec![2],
+                evicted: vec![],
+            }
+        );
+
+        // Jumping away cancels what is no longer needed, 1's preview and 2's
+        // full decode, and keeps 3's preview, as 3 is next to 4.
+        let effects = session.key(Key::End);
+        assert_eq!(decodes(&effects).cancelled, [1, 2]);
+        assert_eq!(decodes(&effects).asked, [(4, fit, false)]);
+        assert_eq!(
+            states(&mut session)[..2],
+            [LoadState::Loading, LoadState::Preview]
+        );
+
+        // A cancelled image is asked for again when it is needed again.
+        let effects = session.key(Key::Home);
+        assert_eq!(decodes(&effects).asked, [(1, fit, false), (2, full, true)]);
+    }
+
+    #[test]
+    fn images_beyond_the_budget_are_evicted_least_recently_shown_first() {
+        let mut session = Session::new();
+        // Each full decode below takes 100 × 100 × 4 bytes.
+        session.app.set_cache_budget(100_000);
+        let paths = [
+            r"C:\1.png",
+            r"C:\2.png",
+            r"C:\3.png",
+            r"C:\4.png",
+            r"C:\5.png",
+        ];
+        session.open(&paths);
+        session.decode(1, 100, 100);
+        session.decode(2, 100, 100);
+        // 3 is neither shown nor next to the shown image, so it goes at once.
+        assert_eq!(decodes(&session.decode(3, 100, 100)).evicted, [3]);
+        assert_eq!(states(&mut session)[2], LoadState::Loading);
+        assert_eq!(
+            session.list().images[2].size,
+            Some(PixelSize::new(100, 100))
+        );
+
+        // Moving on decodes 3 again. The shown image and its neighbours stay
+        // even over the budget.
+        let effects = session.key(Key::Right);
+        assert_eq!(
+            decodes(&effects).asked,
+            [(3, DecodeTarget::Fit { within: WINDOW }, true)]
+        );
+        assert!(decodes(&session.decode(3, 100, 100)).evicted.is_empty());
+        // Moving on again evicts what was shown longest ago.
+        let effects = session.key(Key::Right);
+        assert_eq!(decodes(&effects).evicted, [1]);
+        assert_eq!(states(&mut session)[0], LoadState::Loading);
+
+        // Closing an image drops its decodes and its bitmap.
+        let effects = session.key(Key::Delete);
+        assert!(decodes(&effects).cancelled.contains(&3));
+        assert_eq!(decodes(&effects).evicted, [3]);
+    }
+
     #[test]
     fn an_empty_window_decodes_in_full() {
         let mut session = Session::with(Config {
@@ -2858,39 +3099,50 @@ mod session_tests {
     }
 
     #[test]
-    fn a_changed_file_out_of_sight_is_decoded_when_next_shown() {
-        let mut session = three_images();
-        let selected = session.list().selected.unwrap();
-        let hidden = session
-            .list()
-            .images
-            .iter()
-            .map(|image| image.id)
-            .find(|&id| id != selected)
-            .unwrap();
-        let index = session.list().images.iter().position(|i| i.id == hidden);
-        let effects = session.send(Input::FileChanged { image: hidden });
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Decode { .. }))
-        );
-        assert_eq!(
-            session.list().images[index.unwrap()].state,
-            LoadState::Preview
-        );
-        // Selecting it asks for the full decode.
-        let mut asked = false;
-        for _ in 0..3 {
-            let effects = session.send(Input::Key {
-                key: Key::Right,
-                modifiers: Modifiers::NONE,
-            });
-            asked |= effects.iter().any(|effect| {
-                matches!(effect, Effect::Decode { image, target: DecodeTarget::Full, .. } if *image == hidden)
-            });
+    fn a_changed_file_is_decoded_again_once_shown_or_next_to_the_selection() {
+        let mut session = Session::new();
+        session.open(&[r"C:\1.png", r"C:\2.png", r"C:\3.png", r"C:\4.png"]);
+        for image in 1..=3 {
+            session.decode(image, 100, 100);
         }
-        assert!(asked);
+        let full = DecodeTarget::Full;
+        let mut changed = |image| {
+            decodes(&session.send(Input::FileChanged {
+                image: ImageId(image),
+            }))
+        };
+
+        // The shown image is decoded again at once, its neighbour ahead of
+        // need.
+        assert_eq!(changed(1).asked, [(1, full, false)]);
+        assert_eq!(changed(2).asked, [(2, full, true)]);
+        // A change while the decode is queued asks for it again.
+        assert_eq!(
+            changed(2),
+            Decodes {
+                asked: vec![(2, full, true)],
+                cancelled: vec![2],
+                evicted: vec![],
+            }
+        );
+        // One further away keeps its old pixels until it comes into range,
+        // and one never decoded has nothing to reload.
+        assert_eq!(changed(3), Decodes::default());
+        assert_eq!(changed(4), Decodes::default());
+        assert_eq!(
+            states(&mut session),
+            [
+                LoadState::Preview,
+                LoadState::Preview,
+                LoadState::Preview,
+                LoadState::Loading
+            ]
+        );
+
+        // Moving on brings 3 next to the selection, so its new file is
+        // decoded ahead.
+        let effects = session.key(Key::Right);
+        assert!(decodes(&effects).asked.contains(&(3, full, true)));
     }
 
     #[test]

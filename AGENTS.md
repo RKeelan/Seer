@@ -20,7 +20,7 @@ Never test against the developer's own viewer or show a window on their desktop.
 
 - Pick a unique instance name and pass it as `--instance <name>` to every `seerw` and `seer` call (or set `SEER_INSTANCE`). Viewers on different instances never meet.
 - Start the viewer with `seerw --headless --instance <name> [files…]`. It creates its window but never shows it or takes the focus, and draws on WARP, so screenshots are the same on every machine. `seer open --instance <name> …` then adds images to it.
-- Poll `seer --json list` until each image's `state` is `loaded` before taking a screenshot; decoding happens in the background.
+- Poll `seer --json list` until the shown image's `state` is `loaded` before taking a screenshot; decoding happens in the background. Only the shown image and the ones either side of it are decoded, so in a set of more than three, images further away stay `loading` until the selection nears them.
 - `seer debug input <event>…` feeds keys, pointer events, wheel turns and typed note text to a headless viewer, as JSON events (see `model::app::Input`). `{"type":"resize","size":{"width":128,"height":96}}` gives the client area a known size, which makes screenshots predictable.
 - `seer screenshot <out.png>` writes what the window shows, hidden or not.
 - End the viewer with `seer quit`, never by killing it: `cargo llvm-cov` collects coverage only from processes that exit normally.

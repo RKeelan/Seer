@@ -537,7 +537,9 @@ impl HeadlessViewer {
     }
 
     /// Polls `seer list` until `count` images are open and none is still
-    /// loading, and returns it.
+    /// loading, and returns it. Only the shown image and its neighbours are
+    /// decoded, so in a larger set wait for the images of interest with
+    /// [`HeadlessViewer::wait_for`] instead.
     pub fn wait_until_loaded(&self, count: usize) -> ListReply {
         self.wait_for(|list| {
             list.images.len() == count
