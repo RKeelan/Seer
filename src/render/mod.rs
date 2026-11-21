@@ -6,6 +6,7 @@
 //! - [`draw`]: drawing a scene to a device context.
 //! - [`strip`]: the thumbnail strip.
 //! - [`text`]: text layout through DirectWrite.
+//! - [`vector`]: SVG images drawn as vectors.
 //! - [`offscreen`]: an offscreen target and PNG encoding, for `screenshot` and
 //!   render tests.
 
@@ -15,3 +16,4 @@ pub mod offscreen;
 pub mod scene;
 pub mod strip;
 pub mod text;
+pub mod vector;

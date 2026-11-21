@@ -194,7 +194,9 @@ pub struct OpenReply {
     /// The files that are now in the set, in request order.
     pub images: Vec<OpenedImage>,
     /// The files that could not be added, such as missing files or ones in a
-    /// format Seer does not show.
+    /// format Seer does not show, and those added that need a codec
+    /// extension that is not installed. The latter are in `images` too, and
+    /// the window shows which extension they need.
     pub failed: Vec<OpenFailure>,
 }
 

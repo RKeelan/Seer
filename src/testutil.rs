@@ -15,19 +15,25 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
-use windows::Win32::Foundation::{E_FAIL, GENERIC_READ, GENERIC_WRITE};
+use windows::Win32::Foundation::{
+    E_FAIL, GENERIC_READ, GENERIC_WRITE, VARIANT_FALSE, VARIANT_TRUE,
+};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatBmp, GUID_ContainerFormatGif,
-    GUID_ContainerFormatJpeg, GUID_ContainerFormatPng, GUID_ContainerFormatTiff,
-    GUID_WICPixelFormat8bppIndexed, GUID_WICPixelFormat24bppBGR, GUID_WICPixelFormat32bppBGRA,
-    IWICImagingFactory, IWICPalette, WICBitmapDitherTypeNone, WICBitmapEncoderNoCache,
-    WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    GUID_ContainerFormatHeif, GUID_ContainerFormatJpeg, GUID_ContainerFormatPng,
+    GUID_ContainerFormatTiff, GUID_WICPixelFormat8bppIndexed, GUID_WICPixelFormat24bppBGR,
+    GUID_WICPixelFormat32bppBGR, GUID_WICPixelFormat32bppBGRA, IWICImagingFactory, IWICPalette,
+    WICBitmapDitherTypeNone, WICBitmapEncoderNoCache, WICBitmapPaletteTypeCustom,
+    WICDecodeMetadataCacheOnDemand,
 };
-use windows::Win32::System::Com::StructuredStorage::{IPropertyBag2, PROPVARIANT};
+use windows::Win32::System::Com::StructuredStorage::{
+    CAUB, IPropertyBag2, PROPVARIANT, PropVariantClear,
+};
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemAlloc,
+    CoTaskMemFree,
 };
-use windows::Win32::System::Variant::VT_UI2;
+use windows::Win32::System::Variant::{VT_BOOL, VT_UI1, VT_UI2, VT_VECTOR};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     IShellItemArray, SHCreateShellItemArrayFromIDLists, SHParseDisplayName,
@@ -341,6 +347,148 @@ pub fn write_jpeg_with_orientation(path: &Path, pixels: &Pixels, orientation: u1
     )
 }
 
+/// Writes `pixels` to `path` as HEIF, which needs the HEIF and HEVC codec
+/// extensions. Fails where they are not installed.
+pub fn write_heif(path: &Path, pixels: &Pixels) -> Result<()> {
+    encode_as(
+        &factory()?,
+        path,
+        GUID_ContainerFormatHeif,
+        "HEIF",
+        Frame {
+            width: pixels.width,
+            height: pixels.height,
+            pixel_format: GUID_WICPixelFormat32bppBGR,
+            stride: pixels.width * 4,
+            bytes: &pixels.data,
+            palette: None,
+            orientation: None,
+        },
+    )
+}
+
+/// One frame of an animated GIF for [`write_animated_gif`].
+#[derive(Clone, Debug)]
+pub struct GifFrame {
+    /// The frame's pixels, which must be opaque or fully transparent, in at
+    /// most 255 colours.
+    pub pixels: Pixels,
+    /// Where the frame's top-left corner is on the logical screen.
+    pub left: u16,
+    /// Where the frame's top edge is on the logical screen.
+    pub top: u16,
+    /// How long the frame is shown, in hundredths of a second.
+    pub delay: u16,
+    /// The GIF disposal method: 1 keeps the frame, 2 clears it to the
+    /// background, 3 restores what was there before.
+    pub disposal: u8,
+}
+
+impl GifFrame {
+    /// A frame covering the logical screen from its top-left, shown for
+    /// `delay` hundredths of a second and kept.
+    pub fn whole(pixels: Pixels, delay: u16) -> Self {
+        GifFrame {
+            pixels,
+            left: 0,
+            top: 0,
+            delay,
+            disposal: 1,
+        }
+    }
+}
+
+/// Writes an animated GIF of `width × height` with `frames`, through WIC's
+/// encoder and its frame metadata. With a `loop_count`, the file carries a
+/// `NETSCAPE2.0` extension with that count; without one, it plays once.
+pub fn write_animated_gif(
+    path: &Path,
+    width: u16,
+    height: u16,
+    frames: &[GifFrame],
+    loop_count: Option<u16>,
+) -> Result<()> {
+    let factory = factory()?;
+    // SAFETY: CreateStream has no arguments.
+    let stream = unsafe { factory.CreateStream() }?;
+    // SAFETY: the path outlives the call.
+    unsafe { stream.InitializeFromFilename(&HSTRING::from(path), GENERIC_WRITE.0) }?;
+    // SAFETY: the container GUID outlives the call, and a null vendor lets
+    // WIC choose the encoder.
+    let encoder = unsafe { factory.CreateEncoder(&GUID_ContainerFormatGif, std::ptr::null()) }?;
+    // SAFETY: the stream is live.
+    unsafe { encoder.Initialize(&stream, WICBitmapEncoderNoCache) }?;
+    // SAFETY: GetMetadataQueryWriter has no arguments.
+    let writer = unsafe { encoder.GetMetadataQueryWriter() }?;
+    let mut values = vec![
+        (w!("/logscrdesc/Width"), propvariant_u16(width)),
+        (w!("/logscrdesc/Height"), propvariant_u16(height)),
+    ];
+    if let Some(count) = loop_count {
+        let [low, high] = count.to_le_bytes();
+        values.push((w!("/appext/Application"), propvariant_bytes(b"NETSCAPE2.0")));
+        values.push((w!("/appext/Data"), propvariant_bytes(&[3, 1, low, high, 0])));
+    }
+    let mut set = Ok(());
+    for (name, value) in &mut values {
+        if set.is_ok() {
+            // SAFETY: the name is a static string and the value a live
+            // PROPVARIANT, which WIC copies.
+            set = unsafe { writer.SetMetadataByName(*name, value) };
+        }
+        // SAFETY: the variant was made above and is not used again.
+        let _ = unsafe { PropVariantClear(value) };
+    }
+    set?;
+    for frame in frames {
+        let (colours, indices, transparent) = indexed_frame(&frame.pixels)?;
+        // SAFETY: CreatePalette has no arguments.
+        let palette = unsafe { factory.CreatePalette() }?;
+        // SAFETY: InitializeCustom copies the colours from the slice.
+        unsafe { palette.InitializeCustom(&colours) }?;
+        let mut encode_frame = None;
+        let mut options: Option<IPropertyBag2> = None;
+        // SAFETY: both pointers are to live locals, which receive owned
+        // references.
+        unsafe { encoder.CreateNewFrame(&mut encode_frame, &mut options) }?;
+        let encode_frame =
+            encode_frame.ok_or_else(|| Error::unexpected("WIC returned no frame"))?;
+        let mut format = GUID_WICPixelFormat8bppIndexed;
+        // SAFETY: the options came from CreateNewFrame; the rest are plain
+        // values or live locals.
+        unsafe {
+            encode_frame.Initialize(options.as_ref())?;
+            encode_frame.SetSize(frame.pixels.width, frame.pixels.height)?;
+            encode_frame.SetPixelFormat(&mut format)?;
+            encode_frame.SetPalette(&palette)?;
+        }
+        // SAFETY: GetMetadataQueryWriter has no arguments.
+        let writer = unsafe { encode_frame.GetMetadataQueryWriter() }?;
+        let mut values = vec![
+            (w!("/imgdesc/Left"), propvariant_u16(frame.left)),
+            (w!("/imgdesc/Top"), propvariant_u16(frame.top)),
+            (w!("/grctlext/Delay"), propvariant_u16(frame.delay)),
+            (w!("/grctlext/Disposal"), propvariant_u8(frame.disposal)),
+        ];
+        if let Some(index) = transparent {
+            values.push((w!("/grctlext/TransparencyFlag"), propvariant_bool(true)));
+            values.push((w!("/grctlext/TransparentColorIndex"), propvariant_u8(index)));
+        }
+        for (name, value) in &values {
+            // SAFETY: the name is a static string and the value a live
+            // PROPVARIANT that holds no resources.
+            unsafe { writer.SetMetadataByName(*name, value) }?;
+        }
+        // SAFETY: the buffer holds one index a pixel, `width` to a row.
+        unsafe { encode_frame.WritePixels(frame.pixels.height, frame.pixels.width, &indices) }?;
+        // SAFETY: Commit has no arguments.
+        unsafe { encode_frame.Commit() }?;
+    }
+    // SAFETY: Commit has no arguments.
+    unsafe { encoder.Commit() }?;
+    Ok(())
+}
+
 /// Reads the first frame of an image file as stored, ignoring any EXIF
 /// orientation.
 pub fn read_image(path: &Path) -> Result<Pixels> {
@@ -647,13 +795,24 @@ fn factory() -> Result<IWICImagingFactory> {
 }
 
 fn encode(factory: &IWICImagingFactory, path: &Path, format: Format, frame: Frame) -> Result<()> {
+    let name = format!("{format:?}");
+    encode_as(factory, path, format.container(), &name, frame)
+}
+
+fn encode_as(
+    factory: &IWICImagingFactory,
+    path: &Path,
+    container: GUID,
+    format: &str,
+    frame: Frame,
+) -> Result<()> {
     // SAFETY: CreateStream has no arguments.
     let stream = unsafe { factory.CreateStream() }?;
     // SAFETY: the path outlives the call.
     unsafe { stream.InitializeFromFilename(&HSTRING::from(path), GENERIC_WRITE.0) }?;
     // SAFETY: the container GUID outlives the call, and a null vendor lets
     // WIC choose the encoder.
-    let encoder = unsafe { factory.CreateEncoder(&format.container(), std::ptr::null()) }?;
+    let encoder = unsafe { factory.CreateEncoder(&container, std::ptr::null()) }?;
     // SAFETY: the stream is live.
     unsafe { encoder.Initialize(&stream, WICBitmapEncoderNoCache) }?;
     let mut encode_frame = None;
@@ -673,7 +832,7 @@ fn encode(factory: &IWICImagingFactory, path: &Path, format: Format, frame: Fram
     if pixel_format != frame.pixel_format {
         return Err(windows::core::Error::new(
             E_FAIL,
-            format!("the {format:?} encoder does not accept the pixel format"),
+            format!("the {format} encoder does not accept the pixel format"),
         )
         .into());
     }
@@ -710,6 +869,76 @@ fn propvariant_u16(value: u16) -> PROPVARIANT {
         (*variant.Anonymous.Anonymous).Anonymous.uiVal = value;
     }
     variant
+}
+
+/// A `VT_UI1` PROPVARIANT. It owns nothing.
+fn propvariant_u8(value: u8) -> PROPVARIANT {
+    let mut variant = PROPVARIANT::default();
+    // SAFETY: the variant is zeroed, so writing the type tag and the union
+    // member that tag selects leaves it valid.
+    unsafe {
+        (*variant.Anonymous.Anonymous).vt = VT_UI1;
+        (*variant.Anonymous.Anonymous).Anonymous.bVal = value;
+    }
+    variant
+}
+
+/// A `VT_BOOL` PROPVARIANT. It owns nothing.
+fn propvariant_bool(value: bool) -> PROPVARIANT {
+    let mut variant = PROPVARIANT::default();
+    // SAFETY: the variant is zeroed, so writing the type tag and the union
+    // member that tag selects leaves it valid.
+    unsafe {
+        (*variant.Anonymous.Anonymous).vt = VT_BOOL;
+        (*variant.Anonymous.Anonymous).Anonymous.boolVal =
+            if value { VARIANT_TRUE } else { VARIANT_FALSE };
+    }
+    variant
+}
+
+/// A `VT_VECTOR | VT_UI1` PROPVARIANT holding a copy of `bytes` in COM's task
+/// memory, which `PropVariantClear` frees.
+fn propvariant_bytes(bytes: &[u8]) -> PROPVARIANT {
+    // SAFETY: CoTaskMemAlloc takes a plain size.
+    let copy = unsafe { CoTaskMemAlloc(bytes.len()) }.cast::<u8>();
+    assert!(!copy.is_null(), "out of memory");
+    // SAFETY: the allocation holds `bytes.len()` bytes and does not overlap
+    // `bytes`.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), copy, bytes.len()) };
+    let mut variant = PROPVARIANT::default();
+    // SAFETY: the variant is zeroed, so writing the type tag and the union
+    // member that tag selects leaves it valid; it owns the allocation.
+    unsafe {
+        (*variant.Anonymous.Anonymous).vt = VT_VECTOR | VT_UI1;
+        (*variant.Anonymous.Anonymous).Anonymous.caub = CAUB {
+            cElems: bytes.len() as u32,
+            pElems: copy,
+        };
+    }
+    variant
+}
+
+/// A GIF frame as a palette of WIC colours, one palette index per pixel, and
+/// the index of the transparent colour if any pixel is transparent.
+fn indexed_frame(pixels: &Pixels) -> Result<(Vec<u32>, Vec<u8>, Option<u8>)> {
+    let transparent = pixels.data.as_chunks::<4>().0.iter().any(|p| p[3] == 0);
+    let mut opaque = pixels.clone();
+    for pixel in opaque.data.as_chunks_mut::<4>().0 {
+        if pixel[3] == 0 {
+            // A colour no test uses, to stand for transparency.
+            *pixel = [1, 2, 3, 255];
+        }
+    }
+    let (mut colours, indices) = indexed(&opaque)?;
+    let index = colours.iter().position(|&c| c == 0xFF03_0201);
+    if let Some(index) = index {
+        colours[index] = 0;
+    }
+    Ok((
+        colours,
+        indices,
+        index.filter(|_| transparent).map(|i| i as u8),
+    ))
 }
 
 fn without_alpha(pixels: &Pixels) -> Vec<u8> {
@@ -752,7 +981,6 @@ fn indexed(pixels: &Pixels) -> Result<(Vec<u32>, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 
     use super::*;
     use crate::error::ErrorCode;

@@ -124,14 +124,23 @@ impl Device {
 
     /// A bitmap holding a decoded image.
     pub fn create_bitmap(&self, decoded: &Decoded) -> Result<ID2D1Bitmap1> {
-        let size = decoded.bitmap_size;
+        self.create_bitmap_from(decoded.bitmap_size, &decoded.pixels)
+    }
+
+    /// A bitmap of `size` holding `pixels`, premultiplied BGRA, rows top to
+    /// bottom, tightly packed.
+    pub fn create_bitmap_from(&self, size: PixelSize, pixels: &[u8]) -> Result<ID2D1Bitmap1> {
+        let rows = size.width as usize * 4 * size.height as usize;
+        if pixels.len() < rows {
+            return Err(Error::unexpected("too few pixels for the bitmap"));
+        }
         let properties = bitmap_properties(D2D1_BITMAP_OPTIONS_NONE);
         // SAFETY: the pixels hold `size.height` rows of `size.width × 4`
-        // bytes, which Direct2D copies before returning.
+        // bytes, as checked above, which Direct2D copies before returning.
         let bitmap = unsafe {
             self.context.CreateBitmap(
                 d2d_size(size),
-                Some(decoded.pixels.as_ptr().cast()),
+                Some(pixels.as_ptr().cast()),
                 size.width * 4,
                 &properties,
             )
@@ -339,6 +348,7 @@ fn at_least_one(size: PixelSize) -> PixelSize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::wic::Content;
 
     #[test]
     fn devices_are_created_with_a_warp_fallback() {
@@ -358,11 +368,17 @@ mod tests {
             size: PixelSize::new(4, 2),
             bitmap_size: PixelSize::new(2, 1),
             pixels: vec![255; 8],
+            content: Content::Still,
         };
         let bitmap = device.create_bitmap(&decoded).unwrap();
         // SAFETY: GetPixelSize has no arguments.
         let size = unsafe { bitmap.GetPixelSize() };
         assert_eq!((size.width, size.height), (2, 1));
+        assert!(
+            device
+                .create_bitmap_from(PixelSize::new(2, 2), &[0; 8])
+                .is_err()
+        );
     }
 
     #[test]

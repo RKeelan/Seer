@@ -19,6 +19,12 @@ pub trait Files {
     /// The canonical form of an absolute path to a file, or the reason it
     /// cannot be opened.
     fn canonical(&self, path: &Path) -> Result<PathBuf>;
+
+    /// If the file at `path` needs a codec extension that is not installed,
+    /// the error that names it.
+    fn missing_codec(&self, _path: &Path) -> Option<Error> {
+        None
+    }
 }
 
 /// [`Files`] backed by the filesystem.
@@ -44,6 +50,10 @@ impl Files for DiskFiles {
             ));
         }
         Ok(canonical)
+    }
+
+    fn missing_codec(&self, path: &Path) -> Option<Error> {
+        crate::decode::wic::missing_codec(path)
     }
 }
 
