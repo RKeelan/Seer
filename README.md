@@ -4,19 +4,25 @@
 
 Seer is a fast image viewer for Windows that shows the images it was asked to open and nothing else, in one window, and that agents can drive and read back from.
 
+![An image in Seer, with a mark and its note, and the strip of open images below](docs/viewer.png)
+
 ## Using Seer
 
 Seer runs on Windows 11, x64. It is two programs: `seerw.exe` is the viewer, which owns the window, and `seer.exe` is the command line that drives it.
 
 ### Installing
 
-Run `seer install` from wherever `seer.exe` and `seerw.exe` are. It installs Seer for the current user, without administrator rights:
+Download the zip from the latest [release](https://github.com/RKeelan/Seer/releases), unzip it anywhere, and run `seer install` from that directory. It installs Seer for the current user, without administrator rights:
 
 - It copies both programs to `%LOCALAPPDATA%\Programs\Seer` and adds that directory to your `PATH`, so terminals opened afterwards find `seer`.
 - It registers Seer for the image types it reads, so it appears in Explorer's Open with menu and in Settings > Apps > Default apps. It never makes itself the default: choose it there, or in Open with > Choose another app, for each type you want it to open.
 - It registers the open verb so that Explorer hands a whole selection to one `seerw.exe` through COM, in Explorer's order, and the window selects the first of them. The COM class is a local server in `seerw.exe`, registered for the current user only.
 
-Installing again replaces the programs, even while the viewer is running; the running viewer keeps its old version until it is next started. `seer uninstall` removes the programs, the `PATH` entry and the registrations, and leaves other programs' registrations for the same types alone.
+Installing again replaces the programs, even while the viewer is running; the running viewer keeps its old version until it is next started. `seer uninstall` removes the programs, the `PATH` entry and the registrations, and leaves other programs' registrations for the same types alone. The directory the zip was unpacked to can then be deleted.
+
+### Opening images
+
+Double-click an image in Explorer, or select several and press Enter, once Seer is the default app for their type. Whichever way images arrive, they join the one window, in the order they were opened; opening an image that is already there selects it. Closing the window forgets the images and their marks.
 
 - `seer --version` and `seerw --version` print the program's name and version.
 - `seerw <files…>` opens a window showing the first image, fitted to the window and never enlarged, with the others a key press away. A large image appears at window size first and sharpens once its full-resolution decode finishes. The title bar shows the image's file name and size in pixels.
@@ -30,11 +36,11 @@ The window follows Windows' light or dark setting for apps, title bar and note f
 
 A fitted image stays fitted as the window is resized; otherwise the point at the middle of the window stays there. Moved to a monitor with a different scale, the window keeps its size to the eye and its text and controls scale with it. If the graphics driver restarts or is updated, the viewer moves to a new device and carries on.
 
-Seer reads every still format the Windows Imaging Component can decode: JPEG, PNG, BMP, TIFF, ICO and JPEG XR, plus WebP, HEIC, AVIF and JPEG XL when their codec extensions from the Microsoft Store are installed. An image whose codec is missing shows a message naming the extension to install, and `seer open` reports it as failed with the same message. EXIF orientation is honoured. Colours are treated as sRGB; embedded colour profiles are ignored.
+Seer reads every still format the Windows Imaging Component can decode: JPEG, PNG, BMP, TIFF, ICO and JPEG XR, plus WebP, HEIC, AVIF and JPEG XL when their codec extensions from the Microsoft Store are installed. An image whose codec is missing shows a message naming the extension to install, and `seer open` reports it as failed with the same message. EXIF orientation is honoured.
 
 Animated GIFs play while they are shown, and pause when they are not. As in a browser, a frame with a delay of 10 ms or less shows for 100 ms, a GIF with no loop count plays once, and one with a loop count of n plays n + 1 times (0 means forever). An animation's frames are held in memory whole, up to 1 GB, and count in full towards the memory kept for decoded images.
 
-SVG files are drawn as vectors, so they stay sharp at any zoom. Their size in pixels, which `seer list` reports, is the root element's `width` and `height`, or its `viewBox` where those are missing or not plain numbers, or 300 × 150. Seer draws what Direct2D's SVG support draws: no `<text>` elements, and only some of CSS.
+SVG files are drawn as vectors, so they stay sharp at any zoom. Their size in pixels, which `seer list` reports, is the root element's `width` and `height`, or its `viewBox` where those are missing or not plain numbers, or 300 × 150.
 
 When an open image's file is written, Seer reloads it once the writing stops, keeping the zoom, position, rotation and marks; if the size changed, the same relative point stays in the middle. A file that is locked or only partly written is tried again after a short wait, and the old image stays on screen meanwhile. Until the new file is decoded, `seer list` reports the image as `preview`. An image that is neither shown nor next to the one shown is reloaded only once it is. A deleted file stays open showing its last image, and `seer list` reports it as missing. Seer closes each file once it has read it, so it never stops another program from writing or deleting it, and it watches only the open files, through change notifications on their folders; it never lists a folder.
 
@@ -52,6 +58,24 @@ There is only ever one viewer window. The first `seerw.exe` to start owns it; an
 - `seer install` and `seer uninstall` install and remove Seer for the current user (see [Installing](#installing)).
 
 Every command takes `--json`, which prints the result as JSON on stdout; errors then also appear there as `{"error":{"code":"…","message":"…"}}`. Relative paths are resolved against the current directory before they are sent.
+
+An agent that wants the user's opinion of two renders might open them as a group, wait for the user to mark what is wrong, and read the marks back:
+
+```console
+> seer --json open --group pr --caption before --caption after before.png after.png
+{"type":"opened","images":[{"id":1,"path":"C:\\shots\\before.png","existing":false},{"id":2,"path":"C:\\shots\\after.png","existing":false}],"failed":[]}
+
+> seer --json list
+{"type":"list","images":[{"id":1,"path":"C:\\shots\\before.png","caption":"before","group":"pr","size":{"width":720,"height":480},"state":"loaded","missing":false},{"id":2,"path":"C:\\shots\\after.png","caption":"after","group":"pr","size":{"width":720,"height":480},"state":"loaded","missing":false}],"selected":1,"view":{"zoom":0.7375,"fit":true,"rotation":0,"visible":{"x":0.0,"y":0.0,"width":720.0,"height":480.0}},"compare":null}
+
+> seer --json marks --wait
+{"type":"marks","marks":[{"id":1,"image":1,"path":"C:\\shots\\before.png","rect":{"x":319,"y":338,"width":204,"height":83},"note":"raise the horizon here"}]}
+
+> seer --json marks --wait --timeout 30
+{"error":{"code":"timeout","message":"marking was not finished within 30 seconds"}}
+```
+
+The last exits with code 5. Error codes are stable names, such as `no_viewer`, `file_not_found`, `unsupported_format`, `codec_missing`, `decode_failed`, `usage` and `timeout`; `src/error.rs` lists them all.
 
 `--instance <name>`, or the `SEER_INSTANCE` environment variable, picks which viewer to talk to (default `default`). Viewers on different instances are independent, which lets tests run without disturbing the viewer in use.
 
@@ -80,6 +104,23 @@ Two hidden commands exist for testing:
 - Ctrl+Enter finishes marking, answering any agent waiting on `seer marks --wait`. While one waits, the title bar and a banner across the window say so, and the banner's Done button does the same as Ctrl+Enter.
 - When the shown image belongs to a group, `C` toggles compare view, which shows the group side by side with one shared zoom, pan and rotation, in a grid from four images up, each with its caption (or file name) beneath. The selected image's tile is outlined, and clicking a tile selects it. `S` switches between that and a split view, which draws the image and the next in its group over the same area, divided by a line you can drag, with each one's caption in its top corner. `open --compare` opens the group straight into compare view. In single view the caption shows in the title bar.
 
+![A group of four images in compare view, each with its caption beneath](docs/compare.png)
+
+### The log
+
+The viewer keeps a small log in `%LOCALAPPDATA%\Seer\logs\seerw.log`: when it started and on which instance, how long the first frame took, images that could not be shown, trouble with the graphics device, and panics. Nothing is written before the first frame is on screen, and nothing leaves the machine. Past 1 MB the log is renamed to `seerw.old.log` and started again, so the two together stay small.
+
+The log holds no file names unless the `SEER_LOG_PATHS` environment variable is `1`. Error messages and panic messages can contain file names, so without it the log records an error's code and the place in Seer's source where a panic happened, not their messages. `SEER_LOG_DIR` puts the log in another directory. A viewer started with `--headless` logs only when `SEER_LOG_DIR` is set, so tests leave the log alone.
+
+### Known limits
+
+- Seer runs only on Windows 11, x64.
+- Colours are treated as sRGB, and embedded colour profiles are ignored.
+- SVG is drawn as Direct2D's SVG support draws it: no `<text>` elements, and only some of CSS.
+- WebP, HEIC, AVIF and JPEG XL need Windows' codec extensions from the Microsoft Store.
+- A pinch on a touchscreen does nothing; a touchpad pinch zooms.
+- Seer never opens a folder: only the files it is given.
+
 ## Developing Seer
 
 Seer is a native Win32 program written in Rust. Building it needs the stable Rust toolchain and the Windows SDK's resource compiler, which comes with the Visual Studio C++ build tools; measuring test coverage also needs [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov).
@@ -92,10 +133,15 @@ Both executables are thin entry points over one library: `src/bin/seer.rs` calls
 - `cargo llvm-cov --all-targets --ignore-filename-regex 'src[\\/]bin[\\/]' --fail-under-lines 75` runs the tests and fails if they cover less than 75% of lines. CI runs this check.
 - `cargo fmt` formats the code, and `cargo clippy --all-targets -- -D warnings` lints it.
 - `cargo build --release` then `cargo run --release --example bench` measures the cold start: it generates a 12-megapixel JPEG, starts the release `seerw.exe` on it twenty times, and prints the median and worst time from process creation to the first frame presented and to the window being shown, with the median of each phase between. `--headless` leaves the window hidden and `--runs <n>` changes the count. The target is a median under 150 ms on a mid-range desktop. `seerw --exit-after-first-frame` is what makes this possible: it prints the start-up timings as JSON and exits once the first frame is presented.
+- `cargo build` then `cargo run --example screenshots` makes this README's screenshots in `docs`: it draws the images itself, opens them in a headless viewer, and saves what the viewer shows with `seer screenshot`.
 
 The first frame is the part of start-up that matters most, and the `seer::viewer` module documentation describes how start-up is arranged to reach it quickly.
 
 CI runs on pull requests and on demand, on Windows.
+
+### Releasing
+
+Versions are 0.x.y. To release, set the version in `Cargo.toml`, merge that change, and push a tag of the same version with a `v` in front, such as `v0.1.0`, on the merged commit. The release workflow (`.github/workflows/release.yml`) checks that the tag matches `Cargo.toml`, builds a release build, and publishes a GitHub release for the tag with `seer-<version>-x86_64-windows.zip`, which holds `seer.exe`, `seerw.exe`, `LICENSE` and `README.md`, and with notes generated from the pull requests since the previous release.
 
 ## Licence
 

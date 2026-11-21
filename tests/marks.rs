@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use seer::model::geometry::{PixelRect, PixelSize};
-use seer::protocol::Reply;
+use seer::protocol::{ListReply, Reply};
 use seer::testutil::{
     Format, HeadlessViewer, Pixels, Rgba, TempDir, VIEWER_TIMEOUT, read_image, write_image,
 };
@@ -329,4 +329,47 @@ fn marks_wait_times_out_with_exit_code_5() {
     // The viewer no longer waits.
     assert!(near(screenshot(&viewer, &dir).get(2, 2), Rgba::GREEN));
     assert!(viewer.quit().success());
+}
+
+#[test]
+fn a_viewer_started_after_one_closes_has_no_images_or_marks() {
+    let dir = TempDir::new().unwrap();
+    let (viewer, _) = viewer(&dir);
+    mark(&viewer, (40.0, 30.0), (80.0, 60.0), "gone");
+    assert_eq!(marks(&viewer, &[]).len(), 1);
+    let instance = viewer.instance().to_owned();
+    assert!(viewer.quit().success());
+
+    let mut next = Command::new(SEERW)
+        .args(["--headless", "--instance", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let seer = |args: &[&str]| {
+        Command::new(SEER)
+            .args(["--json", "--instance", &instance])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let deadline = Instant::now() + VIEWER_TIMEOUT;
+    let list = loop {
+        let output = seer(&["list"]);
+        if output.status.success() {
+            break output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the viewer never served its pipe"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let list: ListReply = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(list.images.is_empty(), "{list:?}");
+    let reply: Reply = serde_json::from_slice(&seer(&["marks"]).stdout).unwrap();
+    assert!(matches!(reply, Reply::Marks { marks } if marks.is_empty()));
+    assert!(seer(&["quit"]).status.success());
+    assert!(next.wait().unwrap().success());
 }
