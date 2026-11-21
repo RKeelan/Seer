@@ -2,7 +2,7 @@
 //! cold-start path.
 //!
 //! ```text
-//! seerw [--headless] [--instance <name>] [--] <files…>
+//! seerw [--headless] [--instance <name>] [--no-activate] [--] <files…>
 //! seerw --version
 //! ```
 
@@ -27,6 +27,10 @@ pub struct RunArgs {
     pub headless: bool,
     /// The instance named by `--instance`, unchecked.
     pub instance: Option<String>,
+    /// Show the window without activating it. `seer open` starts the viewer
+    /// this way unless given `--activate`, so an agent never takes the focus
+    /// from the user.
+    pub no_activate: bool,
     /// The files to open, as given.
     pub files: Vec<PathBuf>,
 }
@@ -49,6 +53,7 @@ where
             "--" => options_ended = true,
             "--version" => return Ok(ViewerArgs::Version),
             "--headless" => run.headless = true,
+            "--no-activate" => run.no_activate = true,
             "--instance" => {
                 let name = args
                     .next()
@@ -83,6 +88,7 @@ mod tests {
             ViewerArgs::Run(RunArgs {
                 headless: true,
                 instance: Some("t1".into()),
+                no_activate: false,
                 files: vec!["a.png".into(), r"C:\b.jpg".into()],
             })
         );
@@ -90,6 +96,13 @@ mod tests {
             parse_strs(&["--instance=t2"]).unwrap(),
             ViewerArgs::Run(RunArgs {
                 instance: Some("t2".into()),
+                ..RunArgs::default()
+            })
+        );
+        assert_eq!(
+            parse_strs(&["--no-activate"]).unwrap(),
+            ViewerArgs::Run(RunArgs {
+                no_activate: true,
                 ..RunArgs::default()
             })
         );

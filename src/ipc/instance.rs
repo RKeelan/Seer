@@ -4,10 +4,23 @@
 //! so viewers on different instances never meet. The name comes from
 //! `--instance <name>`, else the `SEER_INSTANCE` environment variable, else
 //! `default`. Tests use a unique instance each.
+//!
+//! - The mutex is `Local\Seer-<instance>`. The viewer that creates it owns the
+//!   instance, and holds it until it exits.
+//! - The pipe is `\\.\pipe\seer-<session id>-<instance>`. Pipe names are
+//!   machine-wide, so the session id keeps two signed-in users apart.
 
 use std::fmt;
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
-use crate::error::{Error, Result};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcessId, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+};
+use windows::core::HSTRING;
+
+use crate::error::{Error, ErrorCode, Result};
 
 /// The instance used when none is given.
 pub const DEFAULT_INSTANCE: &str = "default";
@@ -59,6 +72,79 @@ impl InstanceName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The name of the instance's mutex.
+    pub fn mutex_name(&self) -> String {
+        format!(r"Local\Seer-{}", self.0)
+    }
+
+    /// The name of the instance's pipe in this process's session.
+    pub fn pipe_name(&self) -> String {
+        self.pipe_name_in_session(current_session_id())
+    }
+
+    /// The name of the instance's pipe in the given session.
+    pub fn pipe_name_in_session(&self, session: u32) -> String {
+        format!(r"\\.\pipe\seer-{session}-{}", self.0)
+    }
+
+    /// Whether a viewer holds the instance's mutex, which it does from just
+    /// after it starts until it exits.
+    pub fn is_taken(&self) -> bool {
+        let name = HSTRING::from(self.mutex_name());
+        // SAFETY: OpenMutexW reads the name, which outlives the call.
+        let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &name) };
+        match handle {
+            Ok(handle) => {
+                // SAFETY: the handle is valid and nothing else owns it, so
+                // owning it closes it exactly once.
+                drop(unsafe { OwnedHandle::from_raw_handle(handle.0) });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// The session this process runs in, or 0 if it cannot be read.
+fn current_session_id() -> u32 {
+    let mut session = 0;
+    // SAFETY: both calls take plain values, and `session` outlives the call.
+    let read = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if read.is_ok() { session } else { 0 }
+}
+
+/// Ownership of an instance: its named mutex, held for as long as this value
+/// lives.
+#[derive(Debug)]
+pub struct InstanceMutex {
+    _handle: OwnedHandle,
+}
+
+impl InstanceMutex {
+    /// Takes the instance, or returns `None` if another viewer has it.
+    pub fn acquire(instance: &InstanceName) -> Result<Option<InstanceMutex>> {
+        let name = HSTRING::from(instance.mutex_name());
+        // SAFETY: CreateMutexW reads the name, which outlives the call, and
+        // takes no security attributes.
+        let handle = unsafe { CreateMutexW(None, false, &name) }?;
+        // SAFETY: GetLastError only reads this thread's last-error value, which
+        // CreateMutexW sets to ERROR_ALREADY_EXISTS when the mutex existed.
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        // SAFETY: the handle is valid and nothing else owns it.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        Ok((!existed).then_some(InstanceMutex { _handle: handle }))
+    }
+
+    /// Takes the instance, or fails with [`ErrorCode::AlreadyRunning`].
+    pub fn acquire_or_fail(instance: &InstanceName) -> Result<InstanceMutex> {
+        InstanceMutex::acquire(instance)?.ok_or_else(|| {
+            Error::new(
+                ErrorCode::AlreadyRunning,
+                format!("a viewer is already running on instance {instance}"),
+            )
+        })
+    }
 }
 
 impl fmt::Display for InstanceName {
@@ -106,6 +192,29 @@ mod tests {
         assert_eq!(resolve(None, Some("")), DEFAULT_INSTANCE);
         assert_eq!(resolve(None, None), DEFAULT_INSTANCE);
         assert!(InstanceName::resolve(Some("bad name"), None).is_err());
+    }
+
+    #[test]
+    fn kernel_object_names_carry_the_instance() {
+        let name = InstanceName::new("t-1").unwrap();
+        assert_eq!(name.mutex_name(), r"Local\Seer-t-1");
+        assert_eq!(name.pipe_name_in_session(3), r"\\.\pipe\seer-3-t-1");
+        assert!(name.pipe_name().starts_with(r"\\.\pipe\seer-"));
+        assert!(name.pipe_name().ends_with("-t-1"));
+    }
+
+    #[test]
+    fn one_holder_per_instance() {
+        let name = InstanceName::new(&crate::testutil::unique_instance()).unwrap();
+        assert!(!name.is_taken());
+        let held = InstanceMutex::acquire(&name).unwrap().expect("first taker");
+        assert!(name.is_taken());
+        assert!(InstanceMutex::acquire(&name).unwrap().is_none());
+        let error = InstanceMutex::acquire_or_fail(&name).unwrap_err();
+        assert_eq!(error.code, ErrorCode::AlreadyRunning);
+        drop(held);
+        assert!(!name.is_taken());
+        assert!(InstanceMutex::acquire_or_fail(&name).is_ok());
     }
 
     #[test]

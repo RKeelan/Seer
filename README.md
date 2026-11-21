@@ -10,6 +10,36 @@ Seer runs on Windows 11, x64. It is two programs: `seerw.exe` is the viewer, whi
 
 - `seer --version` and `seerw --version` print the program's name and version.
 
+### The command line
+
+There is only ever one viewer window. The first `seerw.exe` to start owns it; any later one hands its files to the first and exits. `seer.exe` talks to the viewer over a named pipe that only the current user can open and that refuses connections from other machines.
+
+- `seer open [--group G] [--caption C]… [--compare] [--activate] <files…>` adds images to the window, starting the viewer if none is running, and reports the id given to each. The nth `--caption` belongs to the nth file. Without `--activate` the window does not take the focus: a running viewer flashes its taskbar button, and a new one shows behind the active window.
+- `seer list` reports the open images (id, path, caption, group, size and load state), which one is selected, the zoom, the visible region and whether compare view is on.
+- `seer close <id or path>…` removes images, and `seer close --all` removes them all. A bare number is an id; write `.\3` for a file named `3`. Naming an image that is not open is not an error: it is reported on stderr and in the JSON's `not_found`.
+- `seer clear <group>` removes a group's images.
+- `seer marks [--wait] [--timeout <seconds>] [--clear]` reports the marks the user has drawn. `--wait` answers only once the user presses Ctrl+Enter, and `--clear` removes the marks once reported.
+- `seer screenshot <out.png>` saves what the window shows.
+- `seer quit` closes the viewer.
+
+Every command takes `--json`, which prints the result as JSON on stdout; errors then also appear there as `{"error":{"code":"…","message":"…"}}`. Relative paths are resolved against the current directory before they are sent.
+
+`--instance <name>`, or the `SEER_INSTANCE` environment variable, picks which viewer to talk to (default `default`). Viewers on different instances are independent, which lets tests run without disturbing the viewer in use.
+
+Exit codes:
+
+- 0: success.
+- 1: unexpected failure.
+- 2: usage error.
+- 3: no viewer is running (every command except `open`).
+- 4: one or more files could not be opened; the others were.
+- 5: `marks --wait` timed out.
+
+Two hidden commands exist for testing:
+
+- `seer debug input <event>…` feeds synthetic input to a viewer started with `seerw --headless`. Each argument is a JSON event or array of events, such as `{"type":"key","key":"right"}` or `{"type":"pointer_down","button":"right","at":{"x":120,"y":80}}`; an argument of `-` reads events from stdin, one JSON value per line.
+- `seer debug timings` reports the viewer's start-up timings in milliseconds from process creation.
+
 ## Developing Seer
 
 Seer is a native Win32 program written in Rust. Building it needs the stable Rust toolchain and the Windows SDK's resource compiler, which comes with the Visual Studio C++ build tools; measuring test coverage also needs [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov).
