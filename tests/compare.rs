@@ -39,14 +39,15 @@ fn solid(dir: &TempDir, name: &str, colour: Rgba) -> PathBuf {
     path
 }
 
-/// Starts an empty viewer with a 256 × 192 client area at 100% scale.
+/// Starts an empty viewer at 100% scale with a client area of 256 × 192 above
+/// the thumbnail strip, which is 84 pixels high.
 fn viewer() -> HeadlessViewer {
     let viewer =
         HeadlessViewer::start(Path::new(SEERW), Path::new(SEER), &[]).expect("the viewer starts");
     input(
         &viewer,
         &[
-            r#"{"type":"resize","size":{"width":256,"height":192}}"#,
+            r#"{"type":"resize","size":{"width":256,"height":276}}"#,
             r#"{"type":"dpi","dpi":96}"#,
         ],
     );

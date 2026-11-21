@@ -34,20 +34,22 @@ pub struct Capture {
     pub pixels: Vec<u8>,
 }
 
-/// Draws `scene` to an offscreen bitmap of the scene's size and reads it back.
+/// Draws `scene` to an offscreen bitmap of the scene's size, with the images'
+/// and thumbnails' bitmaps, and reads it back.
 /// The device context's target is left unset.
 pub fn render(
     device: &Device,
     renderer: &mut Renderer,
     scene: &Scene,
     bitmaps: &Bitmaps,
+    thumbnails: &Bitmaps,
 ) -> Result<Capture> {
     let size = PixelSize::new(scene.size.width.max(1), scene.size.height.max(1));
     let context = device.context();
     let target = device.create_target(size)?;
     // SAFETY: the target was made on this context's device.
     unsafe { context.SetTarget(&target) };
-    let drawn = renderer.draw(context, scene, bitmaps);
+    let drawn = renderer.draw(context, scene, bitmaps, thumbnails);
     // SAFETY: releasing the target only drops the context's reference.
     unsafe { context.SetTarget(None) };
     drawn?;
@@ -192,10 +194,33 @@ mod tests {
                     interpolation: Interpolation::Smooth,
                     opacity: 1.0,
                 },
+                // A thumbnail is drawn from its own bitmaps; one with none
+                // draws nothing.
+                Item::Thumbnail {
+                    image: ImageId(1),
+                    rect: Rect::new(12.0, 8.0, 4.0, 4.0),
+                },
+                Item::Thumbnail {
+                    image: ImageId(2),
+                    rect: Rect::new(8.0, 8.0, 4.0, 4.0),
+                },
             ],
         };
-        let capture = render(&device, &mut Renderer::default(), &scene, &bitmaps).unwrap();
+        let mut thumbnails = Bitmaps::new();
+        thumbnails.insert(ImageId(1), device.create_bitmap(&quadrants()).unwrap());
+        let capture = render(
+            &device,
+            &mut Renderer::default(),
+            &scene,
+            &bitmaps,
+            &thumbnails,
+        )
+        .unwrap();
         let expected = Pixels::from_fn(16, 12, |x, y| match (x, y) {
+            (12..14, 8..10) => Rgba::RED,
+            (14..16, 8..10) => Rgba::GREEN,
+            (12..14, 10..12) => Rgba::BLUE,
+            (14..16, 10..12) => Rgba::WHITE,
             (12.., 0..4) => Rgba::opaque(255, 255, 0),
             (0..4, 0..4) => Rgba::RED,
             (4..8, 0..4) => Rgba::GREEN,
@@ -226,7 +251,14 @@ mod tests {
                 opacity: 1.0,
             }],
         };
-        let capture = render(&device, &mut Renderer::default(), &scene, &bitmaps).unwrap();
+        let capture = render(
+            &device,
+            &mut Renderer::default(),
+            &scene,
+            &bitmaps,
+            &Bitmaps::new(),
+        )
+        .unwrap();
         let expected = Pixels::from_fn(8, 8, |x, y| match (x, y) {
             (0..4, 0..4) => Rgba::RED,
             (0..4, 4..8) => Rgba::BLUE,
@@ -272,7 +304,14 @@ mod tests {
             ],
         };
         let mut renderer = Renderer::default();
-        let capture = render(&device, &mut renderer, &scene, &Bitmaps::new()).unwrap();
+        let capture = render(
+            &device,
+            &mut renderer,
+            &scene,
+            &Bitmaps::new(),
+            &Bitmaps::new(),
+        )
+        .unwrap();
         let pixels = to_pixels(&capture);
         assert_eq!(pixels.get(100, 1), Rgba::WHITE);
         assert_eq!(pixels.get(95, 10).r, 255);
@@ -286,7 +325,14 @@ mod tests {
         // The dashed outline lights fewer pixels than the solid one.
         assert!(lit(8, 62) < lit(68, 122));
         // Formats and the dash style are reused on the next frame.
-        let again = render(&device, &mut renderer, &scene, &Bitmaps::new()).unwrap();
+        let again = render(
+            &device,
+            &mut renderer,
+            &scene,
+            &Bitmaps::new(),
+            &Bitmaps::new(),
+        )
+        .unwrap();
         assert_eq!(again, capture);
         for align in [Align::Start, Align::End] {
             let scene = Scene {
@@ -300,7 +346,14 @@ mod tests {
                 }],
                 ..scene.clone()
             };
-            render(&device, &mut renderer, &scene, &Bitmaps::new()).unwrap();
+            render(
+                &device,
+                &mut renderer,
+                &scene,
+                &Bitmaps::new(),
+                &Bitmaps::new(),
+            )
+            .unwrap();
         }
     }
 

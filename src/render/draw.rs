@@ -35,16 +35,18 @@ pub struct Renderer {
 
 impl Renderer {
     /// Draws `scene` to `context`'s current target, drawing each image with
-    /// its bitmap in `bitmaps` and skipping images with none.
+    /// its bitmap in `bitmaps` and each thumbnail with its bitmap in
+    /// `thumbnails`, and skipping those with none.
     pub fn draw(
         &mut self,
         context: &ID2D1DeviceContext,
         scene: &Scene,
         bitmaps: &Bitmaps,
+        thumbnails: &Bitmaps,
     ) -> Result<()> {
         // SAFETY: BeginDraw has no arguments; EndDraw below closes it.
         unsafe { context.BeginDraw() };
-        let drawn = self.items(context, scene, bitmaps);
+        let drawn = self.items(context, scene, bitmaps, thumbnails);
         // SAFETY: the transform is a live local.
         unsafe { context.SetTransform(&Matrix3x2::identity()) };
         // SAFETY: no tags are asked for. EndDraw reports errors from the
@@ -59,6 +61,7 @@ impl Renderer {
         context: &ID2D1DeviceContext,
         scene: &Scene,
         bitmaps: &Bitmaps,
+        thumbnails: &Bitmaps,
     ) -> Result<()> {
         // SAFETY: the transform and colour are live locals.
         unsafe {
@@ -102,6 +105,23 @@ impl Renderer {
                         );
                         context.SetTransform(&Matrix3x2::identity());
                         context.PopAxisAlignedClip();
+                    }
+                }
+                Item::Thumbnail { image, rect: r } => {
+                    let Some(bitmap) = thumbnails.get(image) else {
+                        continue;
+                    };
+                    // SAFETY: the bitmap and rectangle are live; the whole
+                    // bitmap is drawn.
+                    unsafe {
+                        context.DrawBitmap(
+                            bitmap,
+                            Some(&rect(*r)),
+                            1.0,
+                            interpolation_mode(Interpolation::Smooth),
+                            None,
+                            None,
+                        );
                     }
                 }
                 Item::FillRect { rect: r, colour: c } => {

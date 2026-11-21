@@ -5,7 +5,7 @@
 //! it to any Direct2D device context, so the window, `screenshot` and the
 //! render tests all draw the same scene. Images are named by id; the renderer
 //! draws the best decoded bitmap it holds for each, and nothing for an image
-//! with none yet.
+//! with none yet. Thumbnails are bitmaps of their own, drawn the same way.
 
 use crate::model::ImageId;
 use crate::model::geometry::{PixelSize, Point, Rect, Transform};
@@ -40,6 +40,13 @@ pub enum Item {
         interpolation: Interpolation,
         /// From 0 (invisible) to 1 (opaque).
         opacity: f32,
+    },
+    /// An image's thumbnail, stretched over a rectangle.
+    Thumbnail {
+        /// The image.
+        image: ImageId,
+        /// Where.
+        rect: Rect,
     },
     /// A filled rectangle.
     FillRect {

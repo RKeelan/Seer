@@ -33,8 +33,8 @@ fn quadrants(dir: &TempDir, name: &str, colours: [Rgba; 4]) -> (PathBuf, Pixels)
     (path, pixels)
 }
 
-/// What a 128 × 96 client area shows of a 64 × 48 image fitted to it: the
-/// image at 100% in the middle, since fitting never enlarges.
+/// What a 128 × 96 area shows of a 64 × 48 image fitted to it: the image at
+/// 100% in the middle, since fitting never enlarges.
 fn centred(image: &Pixels) -> Pixels {
     Pixels::from_fn(128, 96, |x, y| {
         if (32..96).contains(&x) && (24..72).contains(&y) {
@@ -45,17 +45,28 @@ fn centred(image: &Pixels) -> Pixels {
     })
 }
 
+/// The client area's top-left 128 × 96 pixels: all of a client area resized
+/// to 128 × 96, or the area above the thumbnail strip once
+/// [`size_above_strip`] has sized the window.
 fn screenshot(viewer: &HeadlessViewer, dir: &TempDir, name: &str) -> Pixels {
     let path = dir.join(name);
     let reply: Reply = viewer.seer_json([Path::new("screenshot"), &path]);
-    assert_eq!(
-        reply,
-        Reply::Screenshot {
-            path: path.clone(),
-            size: PixelSize::new(128, 96)
-        }
+    let Reply::Screenshot { path: written, .. } = reply else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(written, path);
+    let shot = read_image(&path).unwrap();
+    Pixels::from_fn(128, 96, |x, y| shot.get(x, y))
+}
+
+/// Sizes the client area so that, at 100% scale, the area above the strip of
+/// 84 pixels is 128 × 96.
+fn size_above_strip(viewer: &HeadlessViewer) {
+    debug_input(viewer, r#"{"type":"dpi","dpi":96}"#);
+    debug_input(
+        viewer,
+        r#"{"type":"resize","size":{"width":128,"height":180}}"#,
     );
-    read_image(&path).unwrap()
 }
 
 fn debug_input(viewer: &HeadlessViewer, event: &str) {
@@ -96,10 +107,7 @@ fn an_agent_opens_navigates_and_reads_back_screenshots() {
     assert_eq!(list.images[0].size, Some(PixelSize::new(64, 48)));
     assert_eq!(list.images[0].state, LoadState::Loaded);
 
-    debug_input(
-        &viewer,
-        r#"{"type":"resize","size":{"width":128,"height":96}}"#,
-    );
+    size_above_strip(&viewer);
     assert_similar(
         &centred(&first_pixels),
         &screenshot(&viewer, &dir, "first-shot.png"),
