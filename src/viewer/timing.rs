@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use windows::Win32::Foundation::FILETIME;
+use windows::Win32::Foundation::{FILETIME, HANDLE};
 use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
@@ -26,27 +26,8 @@ impl Timings {
     /// Starts timing, reading when the process was created.
     pub fn start() -> Self {
         let origin = Instant::now();
-        // SAFETY: GetSystemTimePreciseAsFileTime has no arguments.
-        let now = unsafe { GetSystemTimePreciseAsFileTime() };
-        let mut created = FILETIME::default();
-        let mut unused = [FILETIME::default(); 3];
-        // SAFETY: the pseudo-handle is always valid, and every pointer is to
-        // a live local.
-        let known = unsafe {
-            GetProcessTimes(
-                GetCurrentProcess(),
-                &mut created,
-                &mut unused[0],
-                &mut unused[1],
-                &mut unused[2],
-            )
-        }
-        .is_ok();
-        let origin_ms = if known {
-            elapsed_ms(ticks(created), ticks(now))
-        } else {
-            0.0
-        };
+        // SAFETY: the pseudo-handle for the current process is always valid.
+        let origin_ms = process_age_ms(unsafe { GetCurrentProcess() }).unwrap_or(0.0);
         Timings {
             origin,
             origin_ms,
@@ -111,6 +92,31 @@ impl Timings {
     }
 }
 
+/// The milliseconds from the creation of `process` to now, on the clock of
+/// the phases in [`Timings::report`] when `process` is a viewer, or `None` if
+/// Windows cannot say when the process was created. `process` needs query
+/// access. Another process uses this to place a moment of its own on a
+/// viewer's timeline, as the open benchmark does.
+pub fn process_age_ms(process: HANDLE) -> Option<f64> {
+    // SAFETY: GetSystemTimePreciseAsFileTime has no arguments.
+    let now = unsafe { GetSystemTimePreciseAsFileTime() };
+    let mut created = FILETIME::default();
+    let mut unused = [FILETIME::default(); 3];
+    // SAFETY: an invalid handle makes the call fail rather than misbehave,
+    // and every pointer is to a live local.
+    unsafe {
+        GetProcessTimes(
+            process,
+            &mut created,
+            &mut unused[0],
+            &mut unused[1],
+            &mut unused[2],
+        )
+    }
+    .ok()?;
+    Some(elapsed_ms(ticks(created), ticks(now)))
+}
+
 /// A `FILETIME` as one count of 100-nanosecond ticks.
 fn ticks(time: FILETIME) -> u64 {
     (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
@@ -152,6 +158,17 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, ["second", "first"]);
+    }
+
+    #[test]
+    fn process_age_counts_from_creation() {
+        // SAFETY: the pseudo-handle for the current process is always valid.
+        let me = unsafe { GetCurrentProcess() };
+        let first = process_age_ms(me).expect("the current process has an age");
+        let second = process_age_ms(me).expect("the current process has an age");
+        assert!(first > 0.0);
+        assert!(second >= first);
+        assert_eq!(process_age_ms(HANDLE::default()), None);
     }
 
     #[test]

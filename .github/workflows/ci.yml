@@ -49,3 +49,6 @@ jobs:
         run: |
           cargo build --release
           cargo run --release --example bench -- --headless
+
+      - name: Benchmark an open into a running viewer
+        run: cargo run --release --example bench -- --open --headless
