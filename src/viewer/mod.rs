@@ -2,6 +2,7 @@
 //!
 //! - [`args`]: the command line.
 //! - [`window`]: the window class and procedure.
+//! - [`note`]: the note field.
 //! - [`theme`]: light and dark.
 //! - [`watch`]: reloading images that change on disk.
 //! - [`timing`]: start-up timing.
@@ -41,6 +42,7 @@
 
 pub mod args;
 pub mod log;
+pub mod note;
 pub mod theme;
 pub mod timing;
 pub mod watch;
@@ -64,6 +66,7 @@ use windows::Win32::System::Console::{
 };
 
 use self::args::{RunArgs, ViewerArgs};
+use self::note::NoteField;
 use self::timing::Timings;
 use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, WM_REQUEST, Window};
 use crate::decode::wic::Decoded;
@@ -74,7 +77,7 @@ use crate::ipc::instance::{InstanceMutex, InstanceName};
 use crate::ipc::server::{self, Responder, Server};
 use crate::model::ImageId;
 use crate::model::app::{App, Config, Cursor, DecodeTarget, Effect, Input, RequestId};
-use crate::model::geometry::PixelSize;
+use crate::model::geometry::{PixelSize, Rect};
 use crate::model::set::DiskFiles;
 use crate::protocol::{OpenFile, Reply, Request, Response};
 use crate::render::device::{Composition, Device, SwapChain, hardware_device};
@@ -429,6 +432,8 @@ struct Viewer {
     responders: HashMap<RequestId, Responder>,
     visibility: Visibility,
     cursor: Cursor,
+    /// The note field, made the first time it is shown.
+    note: Option<NoteField>,
     /// Whether what is shown has changed since it was last presented.
     dirty: bool,
     /// The first reason a file on the command line could not be shown.
@@ -461,6 +466,7 @@ impl Viewer {
             responders: HashMap::new(),
             visibility: Visibility::Never,
             cursor: Cursor::Arrow,
+            note: None,
             dirty: false,
             first_error: None,
         }
@@ -515,13 +521,29 @@ impl Viewer {
                 }
                 Effect::WakeAfter { ms } => window::set_timer(self.hwnd, WAKE_TIMER, ms),
                 Effect::Quit => window::quit(),
-                // The note field and watching files for changes are not
-                // part of the viewer yet.
-                Effect::ShowNoteField { .. }
-                | Effect::HideNoteField
-                | Effect::Watch { .. }
-                | Effect::Unwatch { .. } => {}
+                Effect::ShowNoteField { rect, text } => self.show_note(rect, &text),
+                Effect::HideNoteField => {
+                    if let Some(note) = &self.note {
+                        note.hide();
+                    }
+                }
+                // Watching files for changes is not part of the viewer yet.
+                Effect::Watch { .. } | Effect::Unwatch { .. } => {}
             }
+        }
+    }
+
+    /// Shows the note field, giving it the keyboard focus when it appears,
+    /// unless the viewer is headless.
+    fn show_note(&mut self, rect: Rect, text: &str) {
+        if self.note.is_none() {
+            self.note = NoteField::create(self.hwnd).ok();
+        }
+        if let Some(note) = &mut self.note
+            && note.show(rect, text)
+            && self.visibility != Visibility::Never
+        {
+            note.focus();
         }
     }
 
@@ -784,6 +806,14 @@ impl Handler for Viewer {
     fn cursor(&mut self) -> Cursor {
         self.cursor
     }
+
+    fn focus(&mut self) {
+        if let Some(note) = &self.note
+            && note.is_shown()
+        {
+            note.focus();
+        }
+    }
 }
 
 /// Lets a GUI-subsystem process print to the console it was started from.
@@ -809,8 +839,8 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::model::app::{Key, Modifiers};
-    use crate::model::geometry::PixelRect;
+    use crate::model::app::{Button, Key, Modifiers};
+    use crate::model::geometry::{PixelRect, Point};
     use crate::protocol::{ListReply, LoadState};
     use crate::testutil::{
         Format, Pixels, Rgba, TempDir, read_image, unique_instance, write_image,
@@ -1056,5 +1086,68 @@ mod tests {
         assert!(viewer.awaited().is_none());
         assert_eq!(viewer.first_error.as_ref().unwrap().exit_code(), 4);
         viewer.finish();
+    }
+
+    #[test]
+    fn the_note_field_shows_what_is_typed_and_hides_when_done() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.join("image.png");
+        write_image(&path, &Pixels::solid(200, 100, Rgba::BLUE), Format::Png).unwrap();
+        let window = Window::create(PixelRect::new(0, 0, 200, 100), "note").unwrap();
+        let (_events, received) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            window.hwnd(),
+            app(&window, false),
+            graphics(&window),
+            Worker::spawn(|| {}),
+            None,
+            Timings::start(),
+            received,
+        );
+        viewer.visibility = Visibility::Shown;
+        viewer.handle(Input::Request {
+            id: COMMAND_LINE,
+            request: open_request(&[path], false),
+        });
+        let output = viewer.worker.recv().unwrap();
+        viewer.accept(output);
+        // Focus passes to the field only while it is shown.
+        viewer.focus();
+        assert!(viewer.note.is_none());
+
+        let pointer = |button, x, y| {
+            [
+                Input::PointerDown {
+                    button,
+                    at: Point::new(x, y),
+                    modifiers: Modifiers::NONE,
+                },
+                Input::PointerMove {
+                    at: Point::new(x + 40.0, y + 20.0),
+                    modifiers: Modifiers::NONE,
+                },
+                Input::PointerUp {
+                    button,
+                    at: Point::new(x + 40.0, y + 20.0),
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        for input in pointer(Button::Right, 10.0, 10.0) {
+            viewer.input(input);
+        }
+        let note = viewer.note.as_ref().expect("the field is made");
+        assert!(note.is_shown());
+        assert_eq!(note.text(), "");
+        // Text that arrives as input, as synthetic input does, is echoed in
+        // the field.
+        viewer.input(Input::NoteText {
+            text: "typed".into(),
+        });
+        assert_eq!(viewer.note.as_ref().unwrap().text(), "typed");
+        viewer.focus();
+        viewer.input(key(Key::Enter));
+        assert!(!viewer.note.as_ref().unwrap().is_shown());
+        assert_eq!(viewer.app.marks().iter().next().unwrap().note, "typed");
     }
 }

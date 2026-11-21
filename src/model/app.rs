@@ -233,11 +233,13 @@ pub enum Effect {
         /// The image.
         image: ImageId,
     },
-    /// Show the note field over the client area, or move it there if shown.
+    /// Show the note field over the client area, or move it there if shown,
+    /// holding `text`. The scene draws the field's box at `rect`; the window
+    /// puts its text control inside it, [`NOTE_PADDING`] from each side.
     ShowNoteField {
         /// Where, in client space.
         rect: Rect,
-        /// The text it starts with.
+        /// The field's text.
         text: String,
     },
     /// Hide the note field.
@@ -490,6 +492,13 @@ fn is_false(value: &bool) -> bool {
 /// `marks --wait`. The banner across the top of the client area says the same.
 pub const WAITING_TITLE: &str = "Agent waiting for your marks (Ctrl+Enter when done)";
 
+/// What the note field shows while it is empty.
+pub const NOTE_PROMPT: &str = "Note: Enter keeps, Escape discards";
+
+/// The space between the note field's box and its text, in pixels at 100%
+/// scale.
+pub const NOTE_PADDING: f64 = 6.0;
+
 /// How long the zoom readout takes to fade in.
 const READOUT_FADE_IN: Duration = Duration::from_millis(150);
 /// How long after the last zoom change the readout starts to fade out.
@@ -511,7 +520,7 @@ const LIGHT_TEXT: Colour = Colour::rgb(28, 28, 28);
 const ACCENT: Colour = Colour::rgb(0, 103, 192);
 const WHITE: Colour = Colour::rgb(255, 255, 255);
 const BLACK: Colour = Colour::rgb(0, 0, 0);
-const MARK: Colour = Colour::rgb(255, 196, 0);
+const MARK: Colour = Colour::rgb(255, 0, 0);
 const SELECTED_MARK: Colour = Colour::rgb(255, 64, 129);
 
 /// How the viewer starts.
@@ -657,7 +666,8 @@ struct Waiter {
 struct Shown {
     title: Option<String>,
     cursor: Cursor,
-    note_field: Option<Rect>,
+    /// Where the note field is and what it holds.
+    note_field: Option<(Rect, String)>,
     wake_at: Option<Instant>,
 }
 
@@ -1182,14 +1192,16 @@ impl App {
         });
     }
 
+    /// The marks, in the order of their images in the set and, within an
+    /// image, the order they were made.
     fn mark_infos(&self) -> Vec<MarkInfo> {
-        self.marks
+        self.set
             .iter()
-            .filter_map(|mark| {
-                Some(MarkInfo {
+            .flat_map(|entry| {
+                self.marks.for_image(entry.id).map(|mark| MarkInfo {
                     id: mark.id,
                     image: mark.image,
-                    path: self.set.get(mark.image)?.path.clone(),
+                    path: entry.path.clone(),
                     rect: mark.rect,
                     note: mark.note.clone(),
                 })
@@ -1538,14 +1550,16 @@ impl App {
             effects.push(Effect::SetCursor { cursor });
         }
 
-        let field = self.note_field();
+        let field = self
+            .note_field()
+            .zip(self.note.as_ref().map(|note| note.text.clone()));
         if field != self.shown.note_field {
-            match (field, &self.note) {
-                (Some(rect), Some(note)) => effects.push(Effect::ShowNoteField {
-                    rect,
-                    text: note.text.clone(),
+            match &field {
+                Some((rect, text)) => effects.push(Effect::ShowNoteField {
+                    rect: *rect,
+                    text: text.clone(),
                 }),
-                _ => effects.push(Effect::HideNoteField),
+                None => effects.push(Effect::HideNoteField),
             }
             self.shown.note_field = field;
         }
@@ -1915,6 +1929,38 @@ impl App {
             });
         }
 
+        if let (Some(field), Some(note)) = (self.note_field(), &self.note) {
+            items.push(Item::FillRect {
+                rect: field,
+                colour: WHITE,
+            });
+            items.push(Item::StrokeRect {
+                rect: field,
+                colour: ACCENT,
+                width: scale,
+                dashed: false,
+            });
+            let padding = NOTE_PADDING * scale;
+            let (words, colour) = if note.text.is_empty() {
+                (NOTE_PROMPT.to_string(), LIGHT_TEXT.with_alpha(0.5))
+            } else {
+                (note.text.clone(), LIGHT_TEXT)
+            };
+            items.push(Item::Text {
+                text: words,
+                rect: Rect::new(
+                    field.x + padding,
+                    field.y,
+                    (field.width - 2.0 * padding).max(0.0),
+                    field.height,
+                ),
+                colour,
+                size: 12.0 * scale,
+                align: Align::Start,
+                bold: false,
+            });
+        }
+
         if let (Some(banner), Some(done)) = (self.banner(), self.done_button()) {
             items.push(Item::FillRect {
                 rect: banner,
@@ -1973,18 +2019,14 @@ impl App {
                 opacity: 1.0,
             });
             for mark in self.marks.for_image(pane.image) {
-                let rect = view.rect_to_client(frame, mark.rect.into());
-                let Some(rect) = intersect(rect, pane.clip) else {
+                let whole = view.rect_to_client(frame, mark.rect.into());
+                let Some(rect) = intersect(whole, pane.clip) else {
                     continue;
                 };
                 let selected = self.selected_mark == Some(mark.id);
                 let colour = if selected { SELECTED_MARK } else { MARK };
-                items.push(Item::StrokeRect {
-                    rect,
-                    colour,
-                    width: if selected { 3.0 } else { 2.0 } * scale,
-                    dashed: false,
-                });
+                let width = if selected { 3.0 } else { 2.0 } * scale;
+                outline(whole, pane.clip, colour, width, items);
                 if !mark.note.is_empty() {
                     let label = Rect::new(
                         rect.x,
@@ -2080,6 +2122,39 @@ fn between(a: Point, b: Point) -> Rect {
     let left = a.x.min(b.x);
     let top = a.y.min(b.y);
     Rect::new(left, top, a.x.max(b.x) - left, a.y.max(b.y) - top)
+}
+
+/// Draws a rectangle's outline as four lines, keeping only what lies inside
+/// `clip`. A mark that runs past the edge of its pane, such as the split
+/// view's divider or the window's edge, is cut off there rather than closed
+/// along it.
+fn outline(rect: Rect, clip: Rect, colour: Colour, width: f64, items: &mut Vec<Item>) {
+    let half = width / 2.0;
+    let within = |value: f64, low: f64, high: f64| (low..=high).contains(&value);
+    let mut line = |from: Point, to: Point| {
+        items.push(Item::Line {
+            from,
+            to,
+            colour,
+            width,
+        });
+    };
+    // The horizontal edges reach over the corners, so the edges meet squarely.
+    let (left, right) = (
+        (rect.x - half).max(clip.x),
+        (rect.right() + half).min(clip.right()),
+    );
+    for y in [rect.y, rect.bottom()] {
+        if right > left && within(y, clip.y, clip.bottom()) {
+            line(Point::new(left, y), Point::new(right, y));
+        }
+    }
+    let (top, bottom) = (rect.y.max(clip.y), rect.bottom().min(clip.bottom()));
+    for x in [rect.x, rect.right()] {
+        if bottom > top && within(x, clip.x, clip.right()) {
+            line(Point::new(x, top), Point::new(x, bottom));
+        }
+    }
 }
 
 fn intersect(a: Rect, b: Rect) -> Option<Rect> {
@@ -2392,6 +2467,37 @@ mod session_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The lines drawn, as their ends.
+    fn lines(scene: &Scene) -> Vec<(Point, Point)> {
+        scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Line { from, to, .. } => Some((*from, *to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether each edge of `rect` is drawn as a line, as a mark's outline is.
+    fn outlined(scene: &Scene, rect: Rect) -> bool {
+        let lines = lines(scene);
+        let horizontal = |y: f64| {
+            lines.iter().any(|(from, to)| {
+                from.y == y && to.y == y && from.x <= rect.x && to.x >= rect.right()
+            })
+        };
+        let vertical = |x: f64| {
+            lines.iter().any(|(from, to)| {
+                from.x == x && to.x == x && from.y <= rect.y && to.y >= rect.bottom()
+            })
+        };
+        horizontal(rect.y)
+            && horizontal(rect.bottom())
+            && vertical(rect.x)
+            && vertical(rect.right())
     }
 
     fn images(scene: &Scene) -> Vec<(u32, Rect)> {
@@ -2786,13 +2892,30 @@ mod session_tests {
         assert!(
             strokes(&session.app.scene()).contains(&(Rect::new(100.0, 100.0, 200.0, 100.0), true))
         );
-        session.send(Input::NoteText { text: "a".into() });
+        // The scene draws the field's box, with a prompt until something is
+        // typed, and the window is told what is typed.
+        let field = Rect::new(308.0, 100.0, 240.0, 28.0);
+        let scene = session.app.scene();
+        assert!(strokes(&scene).contains(&(field, false)));
+        assert!(texts(&scene).contains(&NOTE_PROMPT.to_string()));
+        let effects = session.send(Input::NoteText { text: "a".into() });
+        assert_eq!(
+            effects,
+            [
+                Effect::Redraw,
+                Effect::ShowNoteField {
+                    rect: field,
+                    text: "a".into()
+                }
+            ]
+        );
+        assert!(!texts(&session.app.scene()).contains(&NOTE_PROMPT.to_string()));
         let effects = session.key(Key::Enter);
         assert!(effects.contains(&Effect::HideNoteField));
-        assert!(
-            strokes(&session.app.scene()).contains(&(Rect::new(100.0, 100.0, 200.0, 100.0), false))
-        );
-        assert!(texts(&session.app.scene()).contains(&"a".to_string()));
+        let scene = session.app.scene();
+        assert!(outlined(&scene, Rect::new(100.0, 100.0, 200.0, 100.0)));
+        assert!(!strokes(&scene).contains(&(field, false)));
+        assert!(texts(&scene).contains(&"a".to_string()));
 
         // At 100%, the window's top-left is the image's (400, 300).
         session.key(Key::Char('1'));
@@ -2896,11 +3019,12 @@ mod session_tests {
         session.down(Button::Left, 150.0, 150.0);
         session.up(Button::Left, 150.0, 150.0);
         assert_eq!(session.app.selected_mark, Some(MarkId(1)));
-        assert!(
-            strokes(&session.app.scene())
-                .iter()
-                .any(|(rect, _)| *rect == Rect::new(100.0, 100.0, 200.0, 100.0))
-        );
+        let scene = session.app.scene();
+        assert!(outlined(&scene, Rect::new(100.0, 100.0, 200.0, 100.0)));
+        assert!(scene.items.iter().any(|item| matches!(
+            item,
+            Item::Line { from, colour, .. } if *colour == SELECTED_MARK && from.y == 100.0
+        )));
         // F2 reopens its note; Escape leaves it as it was.
         let effects = session.key(Key::Function(2));
         assert!(effects.contains(&Effect::ShowNoteField {
@@ -3222,7 +3346,13 @@ mod session_tests {
     #[test]
     fn marks_can_be_read_and_cleared_without_waiting() {
         let mut session = three_images();
+        // Marks are reported in the order of their images in the set.
+        session.key(Key::Right);
+        session.mark((300.0, 200.0), (400.0, 300.0), "two");
+        session.key(Key::Left);
         session.mark((100.0, 100.0), (300.0, 200.0), "one");
+        let notes: Vec<String> = session.marks().into_iter().map(|mark| mark.note).collect();
+        assert_eq!(notes, ["one", "two"]);
         let reply = session.ask(Request::Marks {
             wait: false,
             timeout_ms: None,
@@ -3231,7 +3361,7 @@ mod session_tests {
         let Ok(Reply::Marks { marks }) = reply else {
             panic!("{reply:?}");
         };
-        assert_eq!(marks.len(), 1);
+        assert_eq!(marks.len(), 2);
         assert!(session.marks().is_empty());
     }
 
@@ -3397,6 +3527,31 @@ mod session_tests {
         // A mark drawn on the right side belongs to the right image.
         session.mark((500.0, 100.0), (600.0, 200.0), "right");
         assert_eq!(session.marks()[0].image, ImageId(2));
+        // A mark that crosses the divider is cut off there, not closed along
+        // it: its left edge is hidden, and nothing is drawn at the divider
+        // but the divider itself.
+        session.mark((60.0, 300.0), (20.0, 350.0), "across");
+        assert_eq!(session.marks()[1].rect, PixelRect::new(20, 300, 40, 50));
+        let marks: Vec<(Point, Point)> = session
+            .app
+            .scene()
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Line {
+                    from, to, colour, ..
+                } if *colour == MARK && from.y >= 300.0 => Some((*from, *to)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                (Point::new(40.0, 300.0), Point::new(61.0, 300.0)),
+                (Point::new(40.0, 350.0), Point::new(61.0, 350.0)),
+                (Point::new(60.0, 300.0), Point::new(60.0, 350.0)),
+            ]
+        );
 
         // The second image's partner wraps round to the first.
         session.key(Key::Right);

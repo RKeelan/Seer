@@ -24,7 +24,7 @@ There is only ever one viewer window. The first `seerw.exe` to start owns it; an
 - `seer list` reports the open images (id, path, caption, group, size and load state), which one is selected, the zoom, the visible region and whether compare view is on.
 - `seer close <id or path>…` removes images, and `seer close --all` removes them all. A bare number is an id; write `.\3` for a file named `3`. Naming an image that is not open is not an error: it is reported on stderr and in the JSON's `not_found`.
 - `seer clear <group>` removes a group's images.
-- `seer marks [--wait] [--timeout <seconds>] [--clear]` reports the marks the user has drawn. `--wait` answers only once the user presses Ctrl+Enter, and `--clear` removes the marks once reported.
+- `seer marks [--wait] [--timeout <seconds>] [--clear]` reports the marks the user has drawn: for each, its id, its image's id and path, its rectangle (`x`, `y`, `width`, `height` in the image's own pixels, whatever the zoom and rotation) and its note, in the order of the images and then the order the marks were made. `--wait` answers only once the user presses Ctrl+Enter, `--timeout` gives up after that many seconds (which may be fractional) with exit code 5, and `--clear` removes the marks once reported.
 - `seer screenshot <out.png>` saves what the window shows.
 - `seer quit` closes the viewer.
 
@@ -53,7 +53,7 @@ Two hidden commands exist for testing:
 - Dragging with the left or middle button pans.
 - `R` turns the view a quarter turn clockwise and Shift+`R` anticlockwise. The file is never changed.
 - Delete or Ctrl+W closes the shown image.
-- Dragging with the right button draws a mark. `M` toggles mark mode, in which a left drag draws too; `M` or Escape leaves it. Releasing opens a note field beside the box: Enter keeps the mark and Escape discards it. Click a mark to select it, Delete to remove it, and double-click it or press F2 to edit its note. The window does not yet show the note field, so a mark kept with Enter has no note; `seer debug input` can type one in a headless viewer.
+- Dragging with the right button draws a mark. `M` toggles mark mode, in which a left drag draws too; `M` or Escape leaves it. Releasing opens a note field beside the box: Enter keeps the mark and Escape discards it. Click a mark to select it, Delete to remove it, and double-click it or press F2 to edit its note. In a headless viewer, `seer debug input` types a note with a `note_text` event, and screenshots show the field.
 - Ctrl+Enter finishes marking, answering any agent waiting on `seer marks --wait`. While one waits, the title bar and a banner across the window say so, and the banner's Done button does the same as Ctrl+Enter.
 - When the shown image belongs to a group, `C` toggles compare view, which shows the group side by side with one shared zoom, pan and rotation. `S` switches between that and a split view, which draws the image and the next in its group over the same area, divided by a line you can drag.
 

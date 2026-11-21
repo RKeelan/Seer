@@ -22,22 +22,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GWLP_USERDATA,
-    GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextW, HTCLIENT,
-    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZEWE, IsIconic, KillTimer, LoadCursorW,
-    LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SW_RESTORE, SW_SHOWNOACTIVATE,
-    SW_SHOWNORMAL, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowTextW,
-    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_OVERLAPPEDWINDOW,
+    DispatchMessageW, EN_CHANGE, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
+    GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+    GetWindowTextW, HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZEWE, IsIconic,
+    KillTimer, LoadCursorW, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE,
+    WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::error::Result;
 use crate::model::app::{Button, Cursor, Input, Key, Modifiers};
 use crate::model::geometry::{PixelRect, PixelSize, Point};
+use crate::viewer::note;
 
 /// Posted to the window when the decode worker has output ready.
 pub const WM_DECODED: u32 = WM_APP + 1;
@@ -73,6 +74,8 @@ pub trait Handler {
     fn cursor(&mut self) -> Cursor {
         Cursor::Arrow
     }
+    /// The window has the keyboard focus, and may pass it to a child.
+    fn focus(&mut self) {}
 }
 
 type Slot = RefCell<Option<Box<dyn Handler>>>;
@@ -520,7 +523,16 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     handler.timer(wparam.0);
                 }
                 WM_CLOSE => handler.input(Input::CloseWindow),
-                WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+                WM_SETFOCUS => handler.focus(),
+                WM_COMMAND if ((wparam.0 >> 16) & 0xFFFF) as u32 == EN_CHANGE => {
+                    let text = note::text(HWND(lparam.0 as _));
+                    handler.input(Input::NoteText { text });
+                }
+                // Over a child, such as the note field, the child's cursor
+                // shows.
+                WM_SETCURSOR
+                    if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && wparam.0 == hwnd.0 as usize =>
+                {
                     let cursor = cursor_id(handler.cursor());
                     // SAFETY: a system cursor needs no module; a missing one
                     // gives a null handle, which hides the pointer.
