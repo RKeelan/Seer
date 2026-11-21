@@ -50,6 +50,9 @@ pub const WM_DEVICE_READY: u32 = WM_APP + 2;
 /// Posted to the window when the pipe server has requests waiting.
 pub const WM_REQUEST: u32 = WM_APP + 3;
 
+/// Posted to the window when watched files have changed.
+pub const WM_FILES_CHANGED: u32 = WM_APP + 4;
+
 /// The wheel delta of one notch.
 const WHEEL_NOTCH: f64 = 120.0;
 
@@ -79,6 +82,8 @@ pub trait Handler {
     fn focus(&mut self) {}
     /// The system's light or dark setting may have changed.
     fn theme_changed(&mut self) {}
+    /// Watched files have changed.
+    fn files_changed(&mut self) {}
 }
 
 type Slot = RefCell<Option<Box<dyn Handler>>>;
@@ -520,6 +525,7 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 WM_DECODED => handler.decoded(),
                 WM_DEVICE_READY => handler.device_ready(),
                 WM_REQUEST => handler.requests(),
+                WM_FILES_CHANGED => handler.files_changed(),
                 WM_TIMER => {
                     // SAFETY: KillTimer checks the handle and id.
                     let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
@@ -656,6 +662,7 @@ mod tests {
         post(window.hwnd().0 as isize, WM_DECODED);
         post(window.hwnd().0 as isize, WM_DEVICE_READY);
         post(window.hwnd().0 as isize, WM_REQUEST);
+        post(window.hwnd().0 as isize, WM_FILES_CHANGED);
         post(0, WM_DECODED);
         pump();
         send(&window, WM_SIZE, 0, (100 << 16) | 200);

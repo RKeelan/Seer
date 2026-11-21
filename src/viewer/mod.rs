@@ -28,7 +28,7 @@
 //!   take longer than everything else together.
 //! - The main thread draws the first frame on WARP while the window is still
 //!   hidden, and then shows the window, so it never appears blank.
-//! - Only then does the pipe server start.
+//! - Only then do the pipe server and the file watcher start.
 //! - When the hardware device is ready, the frame is drawn there and replaces
 //!   WARP's in one composition commit. The full-resolution decode follows on
 //!   the worker and replaces the preview.
@@ -68,7 +68,8 @@ use windows::Win32::System::Console::{
 use self::args::{RunArgs, ViewerArgs};
 use self::note::NoteField;
 use self::timing::Timings;
-use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, WM_REQUEST, Window};
+use self::watch::{Reloads, Watcher};
+use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, WM_FILES_CHANGED, WM_REQUEST, Window};
 use crate::decode::wic::Decoded;
 use crate::decode::worker::{Job, Output, Worker};
 use crate::error::{Error, ErrorCode, Result};
@@ -95,6 +96,9 @@ const WAKE_TIMER: usize = 1;
 /// The timer that shows a window started with no files that has been sent
 /// nothing to show.
 const SHOW_TIMER: usize = 2;
+
+/// The timer that reloads changed files once they are due.
+const RELOAD_TIMER: usize = 3;
 
 /// How long a viewer started with no files waits for an image before showing
 /// its window empty.
@@ -253,6 +257,7 @@ fn start(args: &RunArgs) -> Result<u8> {
         let _ = writeln!(std::io::stdout(), "{report}");
         return Ok(viewer.first_error.as_ref().map_or(0, Error::exit_code));
     }
+    viewer.watcher.start();
     if matches!(viewer.visibility, Visibility::Hidden { .. }) {
         window::set_timer(window.hwnd(), SHOW_TIMER, EMPTY_SHOW_DELAY_MS);
     }
@@ -442,6 +447,10 @@ struct Viewer {
     dirty: bool,
     /// The first reason a file on the command line could not be shown.
     first_error: Option<Error>,
+    /// Watches the open images' files.
+    watcher: Watcher,
+    /// The changed files waiting to be reloaded.
+    reloads: Reloads,
 }
 
 impl Viewer {
@@ -454,6 +463,7 @@ impl Viewer {
         timings: Timings,
         events: Receiver<PipeEvent>,
     ) -> Self {
+        let posted_to = hwnd.0 as isize;
         Viewer {
             hwnd,
             app,
@@ -473,6 +483,8 @@ impl Viewer {
             note: None,
             dirty: false,
             first_error: None,
+            watcher: Watcher::new(move || window::post(posted_to, WM_FILES_CHANGED)),
+            reloads: Reloads::new(),
         }
     }
 
@@ -531,8 +543,11 @@ impl Viewer {
                         note.hide();
                     }
                 }
-                // Watching files for changes is not part of the viewer yet.
-                Effect::Watch { .. } | Effect::Unwatch { .. } => {}
+                Effect::Watch { image, path } => self.watcher.watch(image, path),
+                Effect::Unwatch { image } => {
+                    self.watcher.unwatch(image);
+                    self.reloads.forget(image);
+                }
             }
         }
     }
@@ -616,7 +631,11 @@ impl Viewer {
     }
 
     /// Takes a decode's output: keeps the bitmap if it is better than the one
-    /// held, and tells the app.
+    /// held, or is the full image read again after its file changed, and
+    /// tells the app.
+    ///
+    /// A reload that fails while an older bitmap is held is tried again
+    /// later, and the app is not told, so the old image stays on screen.
     fn accept(&mut self, output: Output) {
         let preview = output.target != DecodeTarget::Full;
         let (started, finished) = if preview {
@@ -632,7 +651,16 @@ impl Viewer {
         }
         let decoded = match output.result {
             Ok(decoded) => decoded,
-            Err(error) => return self.failed(image, error),
+            Err(error) => {
+                if self.reloads.contains(image) {
+                    self.reloads.failed(image, Instant::now());
+                    self.schedule_reloads();
+                    if self.bitmaps.contains_key(&image) {
+                        return;
+                    }
+                }
+                return self.failed(image, error);
+            }
         };
         // A preview that is the full image needs no full decode after it.
         let target = if decoded.bitmap_size == decoded.size {
@@ -641,10 +669,15 @@ impl Viewer {
             output.target
         };
         let size = decoded.size;
-        if self
-            .bitmap_sizes
-            .get(&image)
-            .is_none_or(|held| held.width < decoded.bitmap_size.width)
+        let reloaded = target == DecodeTarget::Full && self.reloads.contains(image);
+        if reloaded {
+            self.reloads.decoded(image);
+        }
+        if reloaded
+            || self
+                .bitmap_sizes
+                .get(&image)
+                .is_none_or(|held| held.width < decoded.bitmap_size.width)
         {
             match self.graphics.device.create_bitmap(&decoded) {
                 Ok(bitmap) => {
@@ -663,6 +696,34 @@ impl Viewer {
             target,
             size,
         });
+    }
+
+    /// Reloads the changed files that are due, or marks them missing if
+    /// they are gone, and sets the timer for the next.
+    fn reload_due(&mut self) {
+        for image in self.reloads.due(Instant::now()) {
+            let Some(entry) = self.app.set().get(image) else {
+                self.reloads.forget(image);
+                continue;
+            };
+            if entry.path.is_file() {
+                self.handle(Input::FileChanged { image });
+            } else {
+                self.reloads.forget(image);
+                self.handle(Input::FileMissing { image });
+            }
+        }
+        self.schedule_reloads();
+    }
+
+    /// Sets the timer for the next reload that is due, if any.
+    fn schedule_reloads(&self) {
+        if let Some(due) = self.reloads.next_due() {
+            let wait = due.saturating_duration_since(Instant::now());
+            // Round up, so the timer never fires before the reload is due.
+            let ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
+            window::set_timer(self.hwnd, RELOAD_TIMER, ms);
+        }
     }
 
     fn failed(&mut self, image: ImageId, error: Error) {
@@ -797,6 +858,7 @@ impl Handler for Viewer {
                     *waited = true;
                 }
             }
+            RELOAD_TIMER => self.reload_due(),
             _ => {}
         }
         self.finish();
@@ -817,6 +879,14 @@ impl Handler for Viewer {
         {
             note.focus();
         }
+    }
+
+    fn files_changed(&mut self) {
+        let now = Instant::now();
+        for image in self.watcher.changes() {
+            self.reloads.changed(image, now);
+        }
+        self.schedule_reloads();
     }
 
     fn theme_changed(&mut self) {
@@ -1099,6 +1169,112 @@ mod tests {
         assert!(viewer.awaited().is_none());
         assert_eq!(viewer.first_error.as_ref().unwrap().exit_code(), 4);
         viewer.finish();
+    }
+
+    /// The open images, as `seer list` reports them.
+    fn listed(viewer: &mut Viewer) -> ListReply {
+        let id = RequestId(99);
+        let effects = viewer.app.handle(
+            Input::Request {
+                id,
+                request: Request::List,
+            },
+            Instant::now(),
+        );
+        effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Reply {
+                    response: Response::Ok(Reply::List(list)),
+                    ..
+                } => Some(list),
+                _ => None,
+            })
+            .expect("a list")
+    }
+
+    /// Waits for the watcher to report a change, then for the reload to
+    /// come due, and runs it.
+    fn reload(viewer: &mut Viewer, image: ImageId) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !viewer.reloads.contains(image) {
+            assert!(Instant::now() < deadline, "no change seen");
+            std::thread::sleep(Duration::from_millis(10));
+            viewer.files_changed();
+        }
+        while let Some(due) = viewer.reloads.next_due() {
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            viewer.timer(RELOAD_TIMER);
+        }
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_old_image_and_tries_again() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.join("image.png");
+        write_image(&path, &Pixels::solid(40, 30, Rgba::BLUE), Format::Png).unwrap();
+        let window = Window::create(PixelRect::new(0, 0, 100, 100), "reload").unwrap();
+        let (_events, received) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            window.hwnd(),
+            app(&window, true),
+            graphics(&window),
+            Worker::spawn(|| {}),
+            None,
+            Timings::start(),
+            received,
+        );
+        viewer.handle(Input::Request {
+            id: COMMAND_LINE,
+            request: open_request(std::slice::from_ref(&path), false),
+        });
+        let image = viewer.app.set().selected().unwrap();
+        let output = viewer.worker.recv().unwrap();
+        viewer.accept(output);
+        viewer.watcher.start();
+
+        // A rewrite of the same size replaces the bitmap.
+        write_image(&path, &Pixels::solid(40, 30, Rgba::RED), Format::Png).unwrap();
+        reload(&mut viewer, image);
+        let output = viewer.worker.recv().unwrap();
+        viewer.accept(output);
+        assert!(!viewer.reloads.contains(image));
+        let shot = dir.join("shot.png");
+        viewer.screenshot(shot.clone()).unwrap();
+        assert_eq!(read_image(&shot).unwrap().get(50, 50), Rgba::RED);
+
+        // A half-written file is retried, and the old image stays.
+        std::fs::write(&path, b"\x89PNG half").unwrap();
+        reload(&mut viewer, image);
+        let output = viewer.worker.recv().unwrap();
+        viewer.accept(output);
+        assert!(viewer.reloads.contains(image));
+        assert_eq!(listed(&mut viewer).images[0].state, LoadState::Loaded);
+        viewer.screenshot(shot.clone()).unwrap();
+        assert_eq!(read_image(&shot).unwrap().get(50, 50), Rgba::RED);
+
+        // Once the file is gone, it is reported missing.
+        std::fs::remove_file(&path).unwrap();
+        reload(&mut viewer, image);
+        assert!(listed(&mut viewer).images[0].missing);
+        assert!(!viewer.reloads.contains(image));
+
+        // A file that failed from the start reports a failed reload.
+        viewer.reloads.changed(image, Instant::now());
+        viewer.bitmaps.clear();
+        std::fs::write(&path, b"not an image").unwrap();
+        reload(&mut viewer, image);
+        let output = viewer.worker.recv().unwrap();
+        viewer.accept(output);
+        assert_eq!(listed(&mut viewer).images[0].state, LoadState::Failed);
+
+        // Closing the image stops watching it.
+        viewer.input(key(Key::Delete));
+        assert!(!viewer.watcher.is_watching(&path));
+        // A reload due for an image no longer open is dropped.
+        viewer.reloads.changed(image, Instant::now());
+        reload(&mut viewer, image);
+        assert!(!viewer.reloads.contains(image));
     }
 
     #[test]

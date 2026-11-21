@@ -3,11 +3,14 @@
 //! A [`Worker`] decodes [`Job`]s in the order they are submitted, on a thread
 //! of its own, and hands back an [`Output`] for each. After each output it
 //! calls the `notify` function it was spawned with, which the window uses to
-//! post itself a message. It keeps the last file it opened, so a scaled decode
-//! followed by a full one reads the file's header once.
+//! post itself a message. While jobs are queued it keeps the last file it
+//! opened, so a scaled decode followed by a full one reads the file's header
+//! once, and opens it again if the file has changed since. It closes the file
+//! whenever the queue runs dry, so the viewer never holds a shown image's
+//! file open.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -99,7 +102,19 @@ impl Drop for Worker {
 fn run(queue: &Receiver<Job>, outputs: &Sender<Output>, notify: &dyn Fn()) {
     let decoder = Decoder::new();
     let mut open: Option<Source> = None;
-    while let Ok(job) = queue.recv() {
+    loop {
+        let job = match queue.try_recv() {
+            Ok(job) => job,
+            Err(TryRecvError::Empty) => {
+                // Nothing more to read from the file for now: close it.
+                open = None;
+                match queue.recv() {
+                    Ok(job) => job,
+                    Err(_) => return,
+                }
+            }
+            Err(TryRecvError::Disconnected) => return,
+        };
         let started = Instant::now();
         let result = match &decoder {
             Ok(decoder) => decode(decoder, &mut open, &job),
@@ -120,7 +135,10 @@ fn run(queue: &Receiver<Job>, outputs: &Sender<Output>, notify: &dyn Fn()) {
 }
 
 fn decode(decoder: &Decoder, open: &mut Option<Source>, job: &Job) -> Result<Decoded> {
-    if open.as_ref().is_none_or(|source| source.path() != job.path) {
+    if open
+        .as_ref()
+        .is_none_or(|source| source.path() != job.path || !source.is_current())
+    {
         *open = None;
         *open = Some(decoder.open(&job.path)?);
     }
@@ -134,6 +152,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::decode::wic::Decoder;
     use crate::error::ErrorCode;
     use crate::model::geometry::PixelSize;
     use crate::testutil::{Format, Pixels, Rgba, TempDir, write_image};
@@ -174,5 +193,56 @@ mod tests {
         assert!(worker.try_recv().is_none());
         drop(worker);
         assert_eq!(notified.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn the_file_is_closed_once_the_queue_runs_dry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.join("image.png");
+        write_image(&path, &Pixels::solid(40, 20, Rgba::BLUE), Format::Png).unwrap();
+        let worker = Worker::spawn(|| {});
+        worker.submit(Job {
+            image: ImageId(1),
+            path: path.clone(),
+            target: DecodeTarget::Full,
+        });
+        assert!(worker.recv().unwrap().result.is_ok());
+        // Opening the file sharing nothing succeeds only once no other
+        // handle to it is open.
+        let exclusive = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(0)
+                .open(&path)
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while exclusive().is_err() {
+            assert!(Instant::now() < deadline, "the worker kept the file open");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_file_rewritten_after_decoding_is_read_again() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.join("image.png");
+        write_image(&path, &Pixels::solid(40, 20, Rgba::BLUE), Format::Png).unwrap();
+        let decoder = Decoder::new().unwrap();
+        let mut open = None;
+        let job = Job {
+            image: ImageId(1),
+            path: path.clone(),
+            target: DecodeTarget::Full,
+        };
+        let first = decode(&decoder, &mut open, &job).unwrap();
+        assert_eq!(first.size, PixelSize::new(40, 20));
+        // The open file does not stop another program rewriting it.
+        write_image(&path, &Pixels::solid(30, 10, Rgba::RED), Format::Png).unwrap();
+        let second = decode(&decoder, &mut open, &job).unwrap();
+        assert_eq!(second.size, PixelSize::new(30, 10));
+        std::fs::remove_file(&path).unwrap();
     }
 }

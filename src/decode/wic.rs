@@ -9,10 +9,13 @@
 //! while decoding, so a [`Source`] asks it for the smallest such size that is
 //! still large enough, and finishes with WIC's scaler.
 
+use std::fs::{File, Metadata};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, WINCODEC_ERR_COMPONENTNOTFOUND,
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, WINCODEC_ERR_COMPONENTNOTFOUND,
     WINCODEC_ERR_UNKNOWNIMAGEFORMAT,
 };
 use windows::Win32::Graphics::Imaging::{
@@ -26,7 +29,7 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::System::Variant::VT_UI2;
-use windows::core::{GUID, HRESULT, HSTRING, Interface, w};
+use windows::core::{GUID, HRESULT, Interface, w};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::model::app::DecodeTarget;
@@ -64,14 +67,25 @@ impl Decoder {
     }
 
     /// Opens `path` and reads its first frame's size and orientation.
+    ///
+    /// The file is opened sharing reading, writing and deleting, so holding a
+    /// [`Source`] never stops another program from rewriting or deleting it.
     pub fn open(&self, path: &Path) -> Result<Source> {
         let failed = |error: windows::core::Error| open_error(path, &error);
-        // SAFETY: the path outlives the call and no vendor is preferred.
+        let io_failed = |error: std::io::Error| {
+            let code = error.raw_os_error().unwrap_or_default() as u32;
+            failed(HRESULT::from_win32(code).into())
+        };
+        // The standard library shares reading, writing and deleting.
+        let file = File::open(path).map_err(io_failed)?;
+        let stamp = Stamp::of(&file.metadata().map_err(io_failed)?);
+        // SAFETY: the handle is open, and `Source` keeps the file open for
+        // as long as the decoder, which its frame holds, lives. No vendor is
+        // preferred.
         let decoder = unsafe {
-            self.factory.CreateDecoderFromFilename(
-                &HSTRING::from(path),
-                None,
-                GENERIC_READ,
+            self.factory.CreateDecoderFromFileHandle(
+                file.as_raw_handle() as usize,
+                std::ptr::null(),
                 WICDecodeMetadataCacheOnDemand,
             )
         }
@@ -87,7 +101,25 @@ impl Decoder {
             orientation: Orientation::from_exif(read_orientation(&frame)),
             stored: PixelSize::new(width, height),
             frame,
+            stamp,
+            _file: file,
         })
+    }
+}
+
+/// A file's length and last-write time, which change when it is rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl Stamp {
+    fn of(metadata: &Metadata) -> Self {
+        Stamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
     }
 }
 
@@ -98,12 +130,21 @@ pub struct Source {
     path: PathBuf,
     stored: PixelSize,
     orientation: Orientation,
+    stamp: Stamp,
+    /// The file the decoder reads, closed after the frame is released.
+    _file: File,
 }
 
 impl Source {
     /// The path the source was opened from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the file at the source's path is still the one it read: not
+    /// rewritten, replaced or deleted since it was opened.
+    pub fn is_current(&self) -> bool {
+        std::fs::metadata(&self.path).is_ok_and(|metadata| Stamp::of(&metadata) == self.stamp)
     }
 
     /// The image's full size, after orientation.
