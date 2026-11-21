@@ -1,16 +1,23 @@
 //! The decode thread and its queue.
 //!
-//! A [`Worker`] decodes [`Job`]s in the order they are submitted, on a thread
-//! of its own, and hands back an [`Output`] for each. After each output it
-//! calls the `notify` function it was spawned with, which the window uses to
-//! post itself a message. While jobs are queued it keeps the last file it
-//! opened, so a scaled decode followed by a full one reads the file's header
-//! once, and opens it again if the file has changed since. It closes the file
-//! whenever the queue runs dry, so the viewer never holds a shown image's
-//! file open.
+//! A [`Worker`] decodes [`Job`]s on a thread of its own and hands back an
+//! [`Output`] for each. After each output it calls the `notify` function it
+//! was spawned with, which the window uses to post itself a message. While
+//! jobs are queued it keeps the last file it opened, so a scaled decode
+//! followed by a full one reads the file's header once, and opens it again if
+//! the file has changed since. It closes the file whenever the queue runs dry,
+//! so the viewer never holds a shown image's file open.
+//!
+//! Jobs come at two priorities. Those [submitted](Worker::submit) are for
+//! images on screen, and run in the order they came. Those
+//! [prefetched](Worker::prefetch) are decodes ahead of need, and run, also in
+//! order, only when no submitted job is waiting. [`Worker::cancel`] drops an
+//! image's queued jobs of either kind; a job already running finishes.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -45,9 +52,89 @@ pub struct Output {
     pub finished: Instant,
 }
 
+/// The jobs waiting for the thread.
+#[derive(Debug, Default)]
+struct Queue {
+    urgent: VecDeque<Job>,
+    background: VecDeque<Job>,
+    closed: bool,
+}
+
+impl Queue {
+    /// The next job to run: the oldest urgent one, else the oldest in the
+    /// background.
+    fn next(&mut self) -> Option<Job> {
+        self.urgent
+            .pop_front()
+            .or_else(|| self.background.pop_front())
+    }
+
+    /// Drops the queued jobs for `image`.
+    fn cancel(&mut self, image: ImageId) {
+        self.urgent.retain(|job| job.image != image);
+        self.background.retain(|job| job.image != image);
+    }
+
+    /// Drops every queued job, and makes the thread end once it has finished
+    /// the job in hand.
+    fn close(&mut self) {
+        self.closed = true;
+        self.urgent.clear();
+        self.background.clear();
+    }
+}
+
+/// The queue and the signal that it has changed, shared with the thread.
+#[derive(Default)]
+struct Shared {
+    queue: Mutex<Queue>,
+    changed: Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Queue> {
+        // Nothing panics while holding the lock; were it poisoned, the queue
+        // would still be consistent.
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Changes the queue and wakes the thread.
+    fn change(&self, change: impl FnOnce(&mut Queue)) {
+        change(&mut self.lock());
+        self.changed.notify_one();
+    }
+
+    /// Waits for the next job, or for the queue to close. If the queue is
+    /// empty, calls `idle` without holding the lock before waiting.
+    fn wait(&self, idle: impl FnOnce()) -> Option<Job> {
+        let mut idle = Some(idle);
+        let mut queue = self.lock();
+        loop {
+            if queue.closed {
+                return None;
+            }
+            if let Some(job) = queue.next() {
+                return Some(job);
+            }
+            if let Some(idle) = idle.take() {
+                drop(queue);
+                idle();
+                queue = self.lock();
+                continue;
+            }
+            queue = self
+                .changed
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
 /// A thread that decodes images.
 pub struct Worker {
-    jobs: Option<Sender<Job>>,
+    shared: Arc<Shared>,
     outputs: Receiver<Output>,
     thread: Option<JoinHandle<()>>,
 }
@@ -55,25 +142,37 @@ pub struct Worker {
 impl Worker {
     /// Starts the thread. It calls `notify` after each output is ready.
     pub fn spawn(notify: impl Fn() + Send + 'static) -> Self {
-        let (jobs, queue) = mpsc::channel::<Job>();
+        let shared = Arc::new(Shared::default());
         let (send, outputs) = mpsc::channel();
-        let thread = std::thread::Builder::new()
-            .name("decode".into())
-            .spawn(move || run(&queue, &send, &notify))
-            .expect("the decode thread starts");
+        let thread = {
+            let shared = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name("decode".into())
+                .spawn(move || run(&shared, &send, &notify))
+                .expect("the decode thread starts")
+        };
         Worker {
-            jobs: Some(jobs),
+            shared,
             outputs,
             thread: Some(thread),
         }
     }
 
-    /// Queues a job.
+    /// Queues a job for an image on screen, behind the other such jobs and
+    /// ahead of every prefetch.
     pub fn submit(&self, job: Job) {
-        if let Some(jobs) = &self.jobs {
-            // The thread outlives the sender, so this cannot fail.
-            let _ = jobs.send(job);
-        }
+        self.shared.change(|queue| queue.urgent.push_back(job));
+    }
+
+    /// Queues a decode ahead of need, to run when no submitted job waits.
+    pub fn prefetch(&self, job: Job) {
+        self.shared.change(|queue| queue.background.push_back(job));
+    }
+
+    /// Drops the queued jobs for `image`. A job already running finishes, and
+    /// its output still arrives.
+    pub fn cancel(&self, image: ImageId) {
+        self.shared.change(|queue| queue.cancel(image));
     }
 
     /// Waits for the next output.
@@ -91,7 +190,7 @@ impl Drop for Worker {
     /// Lets the thread finish the job in hand, then waits for it to end.
     /// Queued jobs are dropped.
     fn drop(&mut self) {
-        self.jobs = None;
+        self.shared.change(Queue::close);
         while self.outputs.try_recv().is_ok() {}
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -99,22 +198,11 @@ impl Drop for Worker {
     }
 }
 
-fn run(queue: &Receiver<Job>, outputs: &Sender<Output>, notify: &dyn Fn()) {
+fn run(shared: &Shared, outputs: &Sender<Output>, notify: &dyn Fn()) {
     let decoder = Decoder::new();
     let mut open: Option<Source> = None;
-    loop {
-        let job = match queue.try_recv() {
-            Ok(job) => job,
-            Err(TryRecvError::Empty) => {
-                // Nothing more to read from the file for now: close it.
-                open = None;
-                match queue.recv() {
-                    Ok(job) => job,
-                    Err(_) => return,
-                }
-            }
-            Err(TryRecvError::Disconnected) => return,
-        };
+    // Nothing more to read from the file for now: close it.
+    while let Some(job) = shared.wait(|| open = None) {
         let started = Instant::now();
         let result = match &decoder {
             Ok(decoder) => decode(decoder, &mut open, &job),
@@ -244,5 +332,58 @@ mod tests {
         let second = decode(&decoder, &mut open, &job).unwrap();
         assert_eq!(second.size, PixelSize::new(30, 10));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn job(image: u32, path: &std::path::Path) -> Job {
+        Job {
+            image: ImageId(image),
+            path: path.to_owned(),
+            target: DecodeTarget::Full,
+        }
+    }
+
+    #[test]
+    fn the_queue_runs_urgent_jobs_first_and_cancels_by_image() {
+        let path = std::path::Path::new("x.png");
+        let mut queue = Queue::default();
+        queue.background.push_back(job(1, path));
+        queue.background.push_back(job(2, path));
+        queue.urgent.push_back(job(3, path));
+        queue.urgent.push_back(job(2, path));
+        queue.urgent.push_back(job(4, path));
+        queue.cancel(ImageId(2));
+        let order: Vec<u32> = std::iter::from_fn(|| queue.next())
+            .map(|job| job.image.0)
+            .collect();
+        assert_eq!(order, [3, 4, 1]);
+        queue.background.push_back(job(5, path));
+        queue.close();
+        assert!(queue.closed && queue.next().is_none());
+    }
+
+    #[test]
+    fn prefetches_wait_for_submitted_jobs_and_cancelled_ones_never_run() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.join("image.png");
+        write_image(&path, &Pixels::solid(8, 8, Rgba::RED), Format::Png).unwrap();
+        let worker = Worker::spawn(|| {});
+        // Queue everything before the thread can take any of it.
+        {
+            let mut queue = worker.shared.lock();
+            queue.background.push_back(job(1, &path));
+            queue.background.push_back(job(2, &path));
+            queue.urgent.push_back(job(3, &path));
+            queue.cancel(ImageId(2));
+        }
+        worker.shared.changed.notify_one();
+        assert_eq!(worker.recv().unwrap().image, ImageId(3));
+        assert_eq!(worker.recv().unwrap().image, ImageId(1));
+        // The public methods queue and cancel the same way.
+        worker.prefetch(job(4, &path));
+        assert_eq!(worker.recv().unwrap().image, ImageId(4));
+        worker.cancel(ImageId(9));
+        worker.submit(job(5, &path));
+        assert_eq!(worker.recv().unwrap().image, ImageId(5));
+        assert!(worker.try_recv().is_none());
     }
 }

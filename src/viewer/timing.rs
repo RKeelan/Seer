@@ -73,6 +73,19 @@ impl Timings {
         }
     }
 
+    /// Records that `name` was reached at `at`, in place of any earlier time.
+    /// Phases about the latest of something, such as the latest move to
+    /// another image, use this.
+    pub fn record_latest(&mut self, name: &'static str, at: Instant) {
+        self.forget(name);
+        self.record(name, at);
+    }
+
+    /// Forgets that `name` was reached.
+    pub fn forget(&mut self, name: &'static str) {
+        self.phases.retain(|&(recorded, _)| recorded != name);
+    }
+
     /// The milliseconds from the process's creation to `at`.
     pub fn ms(&self, at: Instant) -> f64 {
         let since = if at >= self.origin {
@@ -129,6 +142,16 @@ mod tests {
         assert_eq!(names, ["before", "first", "second"]);
         assert!((report.phases[1].ms - timings.origin_ms).abs() < 1e-9);
         assert!((report.phases[1].ms - report.phases[0].ms - 1.0).abs() < 1e-6);
+
+        timings.record_latest("first", earlier + Duration::from_secs(2));
+        timings.forget("before");
+        let names: Vec<String> = timings
+            .report()
+            .phases
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["second", "first"]);
     }
 
     #[test]

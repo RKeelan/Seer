@@ -28,7 +28,8 @@
 //!   take longer than everything else together.
 //! - The main thread draws the first frame on WARP while the window is still
 //!   hidden, and then shows the window, so it never appears blank.
-//! - Only then do the pipe server and the file watcher start.
+//! - Only then do the pipe server and the file watcher start, and the worker
+//!   start decoding the neighbouring images ahead of need.
 //! - When the hardware device is ready, the frame is drawn there and replaces
 //!   WARP's in one composition commit. The full-resolution decode follows on
 //!   the worker and replaces the preview.
@@ -64,12 +65,14 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use self::args::{RunArgs, ViewerArgs};
 use self::note::NoteField;
 use self::timing::Timings;
 use self::watch::{Reloads, Watcher};
 use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, WM_FILES_CHANGED, WM_REQUEST, Window};
+use crate::decode::cache;
 use crate::decode::wic::Decoded;
 use crate::decode::worker::{Job, Output, Worker};
 use crate::error::{Error, ErrorCode, Result};
@@ -258,6 +261,10 @@ fn start(args: &RunArgs) -> Result<u8> {
         return Ok(viewer.first_error.as_ref().map_or(0, Error::exit_code));
     }
     viewer.watcher.start();
+    if let Some(physical) = physical_memory() {
+        viewer.app.set_cache_budget(cache::budget(physical));
+    }
+    viewer.start_prefetching();
     if matches!(viewer.visibility, Visibility::Hidden { .. }) {
         window::set_timer(window.hwnd(), SHOW_TIMER, EMPTY_SHOW_DELAY_MS);
     }
@@ -451,6 +458,12 @@ struct Viewer {
     watcher: Watcher,
     /// The changed files waiting to be reloaded.
     reloads: Reloads,
+    /// Decodes ahead of need, held back until the first frame is presented
+    /// so they never slow it; `None` once they go straight to the worker.
+    held: Option<Vec<Job>>,
+    /// The image the selection last moved to, until a frame showing it is
+    /// presented.
+    navigation: Option<ImageId>,
 }
 
 impl Viewer {
@@ -485,13 +498,37 @@ impl Viewer {
             first_error: None,
             watcher: Watcher::new(move || window::post(posted_to, WM_FILES_CHANGED)),
             reloads: Reloads::new(),
+            held: Some(Vec::new()),
+            navigation: None,
+        }
+    }
+
+    /// Sends the decodes ahead of need held back for the first frame to the
+    /// worker, and sends later ones straight there.
+    fn start_prefetching(&mut self) {
+        for job in self.held.take().unwrap_or_default() {
+            self.worker.prefetch(job);
         }
     }
 
     /// Hands an input to the app, carries out the effects, and presents the
     /// frame if it changed.
+    ///
+    /// A move from one image to another is timed, as `navigated` and then
+    /// `navigation_presented` when a frame showing the new image is
+    /// presented. If the frame waited for a decode, `navigation_decoded`
+    /// records when that finished.
     fn handle(&mut self, input: Input) {
-        let effects = self.app.handle(input, Instant::now());
+        let before = self.app.set().selected();
+        let now = Instant::now();
+        let effects = self.app.handle(input, now);
+        let after = self.app.set().selected();
+        if before.is_some() && after.is_some() && after != before {
+            self.navigation = after;
+            self.timings.record_latest("navigated", now);
+            self.timings.forget("navigation_decoded");
+            self.timings.forget("navigation_presented");
+        }
         self.perform(effects);
     }
 
@@ -518,7 +555,28 @@ impl Viewer {
                     path,
                     target,
                 }),
+                Effect::Prefetch {
+                    image,
+                    path,
+                    target,
+                } => {
+                    let job = Job {
+                        image,
+                        path,
+                        target,
+                    };
+                    match &mut self.held {
+                        Some(held) => held.push(job),
+                        None => self.worker.prefetch(job),
+                    }
+                }
                 Effect::CancelDecode { image } => {
+                    self.worker.cancel(image);
+                    if let Some(held) = &mut self.held {
+                        held.retain(|job| job.image != image);
+                    }
+                }
+                Effect::Evict { image } => {
                     self.bitmaps.remove(&image);
                     self.bitmap_sizes.remove(&image);
                     self.pixels.remove(&image);
@@ -649,6 +707,10 @@ impl Viewer {
         if self.app.set().get(image).is_none() {
             return;
         }
+        if self.navigation == Some(image) {
+            self.timings
+                .record_latest("navigation_decoded", output.finished);
+        }
         let decoded = match output.result {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -745,7 +807,14 @@ impl Viewer {
             &mut self.renderer,
             &scene,
             &self.bitmaps,
-        )
+        )?;
+        if let Some(image) = self.navigation
+            && self.bitmaps.contains_key(&image)
+        {
+            self.navigation = None;
+            self.timings.mark("navigation_presented");
+        }
+        Ok(())
     }
 
     /// Moves to the hardware device, if it is ready: uploads the images,
@@ -897,6 +966,17 @@ impl Handler for Viewer {
         theme::set_title_bar(self.hwnd, dark);
         self.input(Input::Theme { dark });
     }
+}
+
+/// The machine's physical memory in bytes, if Windows says.
+fn physical_memory() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the pointer is to a live local whose dwLength gives its size.
+    unsafe { GlobalMemoryStatusEx(&mut status) }.ok()?;
+    Some(status.ullTotalPhys)
 }
 
 /// Lets a GUI-subsystem process print to the console it was started from.
@@ -1249,7 +1329,7 @@ mod tests {
         let output = viewer.worker.recv().unwrap();
         viewer.accept(output);
         assert!(viewer.reloads.contains(image));
-        assert_eq!(listed(&mut viewer).images[0].state, LoadState::Loaded);
+        assert_eq!(listed(&mut viewer).images[0].state, LoadState::Preview);
         viewer.screenshot(shot.clone()).unwrap();
         assert_eq!(read_image(&shot).unwrap().get(50, 50), Rgba::RED);
 
