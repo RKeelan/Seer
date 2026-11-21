@@ -1,13 +1,19 @@
 //! Helpers for tests: image files generated through WIC's encoders, images
-//! read back through its decoders, pixel comparison, temporary directories
-//! and unique instance names.
+//! read back through its decoders, pixel comparison, temporary directories,
+//! unique instance names, and [`HeadlessViewer`], which runs a viewer for
+//! end-to-end tests.
 //!
 //! Test images are generated, never checked in. Unit tests get this module
 //! through `cfg(test)`; integration tests get it through the `testutil`
 //! feature, which the crate's dev-dependency on itself turns on.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use serde::de::DeserializeOwned;
 
 use windows::Win32::Foundation::{E_FAIL, GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Graphics::Imaging::{
@@ -25,6 +31,9 @@ use windows::Win32::System::Variant::VT_UI2;
 use windows::core::{GUID, HSTRING, w};
 
 use crate::error::{Error, Result};
+use crate::ipc::client;
+use crate::ipc::instance::InstanceName;
+use crate::protocol::{ListReply, LoadState};
 
 /// A colour with straight (not premultiplied) alpha.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -420,6 +429,150 @@ fn unique_name(prefix: &str) -> String {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// How long [`HeadlessViewer`] waits for a viewer to start, to load images,
+/// or to exit.
+pub const VIEWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A headless viewer on an instance of its own, for end-to-end tests.
+///
+/// It is ended with `seer quit` when dropped, never killed: coverage is
+/// collected only from processes that exit normally.
+#[derive(Debug)]
+pub struct HeadlessViewer {
+    instance: String,
+    seer: PathBuf,
+    process: Option<Child>,
+}
+
+impl HeadlessViewer {
+    /// Starts `seerw --headless` from `seerw` on a new instance, opening
+    /// `files`, and waits until it serves its pipe. `seer` is the command
+    /// line, used to talk to it. Integration tests pass
+    /// `env!("CARGO_BIN_EXE_seerw")` and `env!("CARGO_BIN_EXE_seer")`.
+    pub fn start(seerw: &Path, seer: &Path, files: &[&Path]) -> Result<Self> {
+        let instance = unique_instance();
+        let mut process = Command::new(seerw)
+            .args(["--headless", "--instance", &instance])
+            .args(files)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let name = InstanceName::new(&instance)?;
+        let connected = client::connect_to_started(&name, &mut process, VIEWER_TIMEOUT);
+        // Made before the check, so a viewer that failed to connect is still
+        // ended on drop.
+        let viewer = HeadlessViewer {
+            instance,
+            seer: seer.to_owned(),
+            process: Some(process),
+        };
+        connected?;
+        Ok(viewer)
+    }
+
+    /// The viewer's instance name.
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// Runs `seer --instance <this viewer's> <args>` and returns its output.
+    pub fn seer<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new(&self.seer)
+            .args(["--instance", &self.instance])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("seer runs")
+    }
+
+    /// Runs `seer --json --instance <this viewer's> <args>`, checks that it
+    /// succeeded, and parses what it printed.
+    pub fn seer_json<T, I, S>(&self, args: I) -> T
+    where
+        T: DeserializeOwned,
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut all: Vec<OsString> = vec!["--json".into()];
+        all.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
+        let output = self.seer(&all);
+        assert!(
+            output.status.success(),
+            "seer {all:?} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "seer {all:?} printed {}: {error}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    }
+
+    /// `seer list`.
+    pub fn list(&self) -> ListReply {
+        self.seer_json(["list"])
+    }
+
+    /// Polls `seer list` until `done` is true of it, and returns it. Panics
+    /// after [`VIEWER_TIMEOUT`].
+    pub fn wait_for(&self, done: impl Fn(&ListReply) -> bool) -> ListReply {
+        let deadline = Instant::now() + VIEWER_TIMEOUT;
+        loop {
+            let list = self.list();
+            if done(&list) {
+                return list;
+            }
+            assert!(Instant::now() < deadline, "gave up waiting: {list:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Polls `seer list` until `count` images are open and none is still
+    /// loading, and returns it.
+    pub fn wait_until_loaded(&self, count: usize) -> ListReply {
+        self.wait_for(|list| {
+            list.images.len() == count
+                && list
+                    .images
+                    .iter()
+                    .all(|image| matches!(image.state, LoadState::Loaded | LoadState::Failed))
+        })
+    }
+
+    /// Ends the viewer with `seer quit` and returns its exit status.
+    pub fn quit(mut self) -> ExitStatus {
+        self.stop().expect("the viewer exits")
+    }
+
+    fn stop(&mut self) -> Option<ExitStatus> {
+        let mut process = self.process.take()?;
+        let _ = self.seer(["quit"]);
+        let deadline = Instant::now() + VIEWER_TIMEOUT;
+        loop {
+            match process.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+impl Drop for HeadlessViewer {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// One frame to encode.

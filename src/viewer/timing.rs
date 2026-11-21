@@ -65,6 +65,14 @@ impl Timings {
         self.phases.push((name, at));
     }
 
+    /// Records that `name` was reached at `at`, unless it was reached before.
+    /// Start-up timings are about the first image, not those opened later.
+    pub fn record_first(&mut self, name: &'static str, at: Instant) {
+        if self.phases.iter().all(|&(recorded, _)| recorded != name) {
+            self.record(name, at);
+        }
+    }
+
     /// The milliseconds from the process's creation to `at`.
     pub fn ms(&self, at: Instant) -> f64 {
         let since = if at >= self.origin {
@@ -115,6 +123,7 @@ mod tests {
         timings.mark("second");
         timings.record("first", earlier);
         timings.record("before", earlier - Duration::from_millis(1));
+        timings.record_first("first", earlier + Duration::from_secs(1));
         let report = timings.report();
         let names: Vec<&str> = report.phases.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["before", "first", "second"]);

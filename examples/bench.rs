@@ -9,8 +9,9 @@
 //! Each run starts `seerw` on a fresh instance with `--exit-after-first-frame`
 //! and reads the timings it prints. The window is shown unless `--headless` is
 //! given, because showing it is part of what is being measured. The report
-//! gives each run's time, then the median and worst, then the median of each
-//! phase so a slow phase stands out.
+//! gives each run's time, then the median and worst of the first present and
+//! of the window being shown, then the median of each phase so a slow phase
+//! stands out.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -106,8 +107,15 @@ fn run() -> Result<(), String> {
     println!(
         "first_present: median {:.1} ms, worst {:.1} ms",
         median(&mut presents),
-        presents.iter().copied().fold(f64::MIN, f64::max)
+        worst(&presents)
     );
+    if let Some(shown) = phases.get_mut("shown") {
+        println!(
+            "shown: median {:.1} ms, worst {:.1} ms",
+            median(shown),
+            worst(shown)
+        );
+    }
     println!("median of each phase, in ms from process creation:");
     let mut medians: Vec<(f64, String)> = phases
         .into_iter()
@@ -175,6 +183,10 @@ fn photo() -> Pixels {
             ((x + y) * 100 / (WIDTH + HEIGHT) + 80 + grain) as u8,
         )
     })
+}
+
+fn worst(values: &[f64]) -> f64 {
+    values.iter().copied().fold(f64::MIN, f64::max)
 }
 
 fn median(values: &mut [f64]) -> f64 {
