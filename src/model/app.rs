@@ -521,7 +521,9 @@ const ACCENT: Colour = Colour::rgb(0, 103, 192);
 const WHITE: Colour = Colour::rgb(255, 255, 255);
 const BLACK: Colour = Colour::rgb(0, 0, 0);
 const MARK: Colour = Colour::rgb(255, 0, 0);
-const SELECTED_MARK: Colour = Colour::rgb(255, 64, 129);
+/// Blue: told apart from the marks' red even by red-green colour-blind users,
+/// and about as visible as red against both light and dark content.
+const SELECTED_MARK: Colour = Colour::rgb(0, 120, 255);
 
 /// How the viewer starts.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -980,6 +982,10 @@ impl App {
                 return;
             }
         }
+        if let Some(mark) = self.note_at(at) {
+            self.selected_mark = Some(mark);
+            return;
+        }
         let Some(pane) = self.pane_at(at) else {
             return;
         };
@@ -1095,9 +1101,10 @@ impl App {
         if button != Button::Left {
             return;
         }
-        let mark = self
-            .pane_at(at)
-            .and_then(|pane| self.mark_at(pane.image, at));
+        let mark = self.note_at(at).or_else(|| {
+            self.pane_at(at)
+                .and_then(|pane| self.mark_at(pane.image, at))
+        });
         if let Some(mark) = mark {
             self.gesture = Gesture::Idle;
             self.edit_mark(mark);
@@ -1113,6 +1120,23 @@ impl App {
         let view = self.view(image);
         let tolerance = self.drag_threshold() / view.zoom(frame);
         self.marks.hit(image, view.to_image(frame, at), tolerance)
+    }
+
+    /// The mark whose drawn note is at `at`, topmost first: notes are drawn
+    /// over the images, so they can be hit outside their own pane.
+    fn note_at(&self, at: Point) -> Option<MarkId> {
+        let scale = self.scale();
+        self.panes().iter().rev().find_map(|pane| {
+            let frame = self.frame(pane)?;
+            let view = self.view(pane.image);
+            let marks: Vec<_> = self.marks.for_image(pane.image).collect();
+            marks.into_iter().rev().find_map(|mark| {
+                let whole = view.rect_to_client(frame, mark.rect.into());
+                let visible = intersect(whole, pane.clip)?;
+                (!mark.note.is_empty() && note_label(visible, scale).contains(at))
+                    .then_some(mark.id)
+            })
+        })
     }
 
     fn drag_threshold(&self) -> f64 {
@@ -2028,12 +2052,7 @@ impl App {
                 let width = if selected { 3.0 } else { 2.0 } * scale;
                 outline(whole, pane.clip, colour, width, items);
                 if !mark.note.is_empty() {
-                    let label = Rect::new(
-                        rect.x,
-                        rect.y - 22.0 * scale,
-                        rect.width.max(200.0 * scale),
-                        20.0 * scale,
-                    );
+                    let label = note_label(rect, scale);
                     items.push(Item::FillRect {
                         rect: label,
                         colour: background.with_alpha(0.75),
@@ -2155,6 +2174,18 @@ fn outline(rect: Rect, clip: Rect, colour: Colour, width: f64, items: &mut Vec<I
             line(Point::new(x, top), Point::new(x, bottom));
         }
     }
+}
+
+/// Where a mark's note is drawn: a strip above the part of its box that is
+/// visible, at least wide enough for a short note. Drawing and hit-testing
+/// both place notes with this.
+fn note_label(visible: Rect, scale: f64) -> Rect {
+    Rect::new(
+        visible.x,
+        visible.y - 22.0 * scale,
+        visible.width.max(200.0 * scale),
+        20.0 * scale,
+    )
 }
 
 fn intersect(a: Rect, b: Rect) -> Option<Rect> {
@@ -3080,6 +3111,53 @@ mod session_tests {
         session.up(Button::Left, 150.0, 150.0);
         session.key(Key::Right);
         assert_eq!(session.app.selected_mark, None);
+    }
+
+    #[test]
+    fn a_note_selects_and_edits_its_mark_like_its_box() {
+        let mut session = three_images();
+        session.mark((100.0, 100.0), (300.0, 200.0), "first");
+        session.mark((400.0, 300.0), (500.0, 400.0), "second");
+        session.mark((100.0, 400.0), (200.0, 500.0), "");
+        let visible = session.view().visible;
+        // The note is drawn in a strip above the box, wider than a narrow box.
+        let label = Rect::new(400.0, 278.0, 200.0, 20.0);
+        assert!(session.app.scene().items.iter().any(|item| matches!(
+            item,
+            Item::Text { text, rect, .. } if text == "second" && *rect == label
+        )));
+        // Pressing the note selects the mark; dragging from it neither pans
+        // nor draws.
+        session.drag(Button::Left, (550.0, 288.0), (650.0, 350.0));
+        assert_eq!(session.app.selected_mark, Some(MarkId(2)));
+        assert_eq!(session.view().visible, visible);
+        session.drag(Button::Right, (150.0, 88.0), (250.0, 150.0));
+        assert_eq!(session.app.selected_mark, Some(MarkId(1)));
+        assert!(session.app.note.is_none());
+        session.key(Key::Char('m'));
+        session.drag(Button::Left, (550.0, 288.0), (650.0, 350.0));
+        session.key(Key::Char('m'));
+        assert_eq!(session.app.selected_mark, Some(MarkId(2)));
+        assert!(session.app.note.is_none());
+        assert_eq!(session.marks().len(), 3);
+        // A mark without a note has nothing above it to press.
+        session.down(Button::Left, 150.0, 388.0);
+        session.up(Button::Left, 150.0, 388.0);
+        assert_eq!(session.app.selected_mark, None);
+        // Double-clicking the note opens it for editing.
+        session.down(Button::Left, 150.0, 88.0);
+        session.send(Input::DoubleClick {
+            button: Button::Left,
+            at: Point::new(150.0, 88.0),
+            modifiers: Modifiers::NONE,
+        });
+        session.up(Button::Left, 150.0, 88.0);
+        session.send(Input::NoteText {
+            text: "edited".into(),
+        });
+        session.key(Key::Enter);
+        assert_eq!(session.marks()[0].note, "edited");
+        assert_eq!(session.app.selected_mark, Some(MarkId(1)));
     }
 
     #[test]

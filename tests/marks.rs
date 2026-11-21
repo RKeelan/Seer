@@ -19,6 +19,8 @@ const SEER: &str = env!("CARGO_BIN_EXE_seer");
 const BANNER: Rgba = Rgba::opaque(0, 103, 192);
 /// A mark's outline.
 const MARK: Rgba = Rgba::opaque(255, 0, 0);
+/// A selected mark's outline.
+const SELECTED_MARK: Rgba = Rgba::opaque(0, 120, 255);
 
 /// Starts a viewer on a 256 × 192 green image, in a 128 × 96 client area at
 /// 100% scale, where the image fits at 50%.
@@ -215,6 +217,49 @@ fn marks_are_reported_in_image_pixels_at_any_zoom_and_rotation() {
     // --clear removes the marks once reported.
     assert_eq!(marks(&viewer, &["--clear"]).len(), 4);
     assert!(marks(&viewer, &[]).is_empty());
+    assert!(viewer.quit().success());
+}
+
+#[test]
+fn a_mark_is_selected_and_edited_through_its_note() {
+    let dir = TempDir::new().unwrap();
+    let (viewer, _) = viewer(&dir);
+    // The note is drawn in a strip from 22 to 2 pixels above the box, at
+    // least 200 pixels wide, so (80, 28) is on the note but not the box.
+    mark(&viewer, (16.0, 40.0), (48.0, 60.0), "box");
+    assert!(near(screenshot(&viewer, &dir).get(30, 40), MARK));
+
+    // Dragging from the note selects the mark without panning the image.
+    input(
+        &viewer,
+        &[
+            r#"{"type":"pointer_down","button":"left","at":{"x":80,"y":28}}"#,
+            r#"{"type":"pointer_move","at":{"x":120,"y":90}}"#,
+            r#"{"type":"pointer_up","button":"left","at":{"x":120,"y":90}}"#,
+        ],
+    );
+    let shot = screenshot(&viewer, &dir);
+    assert!(
+        near(shot.get(30, 40), SELECTED_MARK),
+        "{:?}",
+        shot.get(30, 40)
+    );
+
+    // Double-clicking the note opens it for editing.
+    input(
+        &viewer,
+        &[
+            r#"{"type":"pointer_down","button":"left","at":{"x":80,"y":28}}"#,
+            r#"{"type":"double_click","button":"left","at":{"x":80,"y":28}}"#,
+            r#"{"type":"pointer_up","button":"left","at":{"x":80,"y":28}}"#,
+            r#"{"type":"note_text","text":"edited"}"#,
+            r#"{"type":"key","key":"enter"}"#,
+        ],
+    );
+    assert_eq!(
+        marks(&viewer, &[]),
+        [(PixelRect::new(32, 80, 64, 40), "edited".to_string())]
+    );
     assert!(viewer.quit().success());
 }
 
