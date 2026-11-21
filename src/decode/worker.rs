@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
@@ -208,6 +208,11 @@ impl Worker {
     /// Waits for the next output.
     pub fn recv(&self) -> Option<Output> {
         self.outputs.recv().ok()
+    }
+
+    /// Waits up to `timeout` for the next output.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<Output> {
+        self.outputs.recv_timeout(timeout).ok()
     }
 
     /// The next output, if one is ready.
