@@ -1298,8 +1298,8 @@ mod tests {
     use crate::model::geometry::{PixelRect, Point};
     use crate::protocol::{ListReply, LoadState};
     use crate::testutil::{
-        Format, GifFrame, Pixels, Rgba, TempDir, read_image, unique_instance, write_animated_gif,
-        write_image,
+        Format, GifFrame, Pixels, Rgba, TempDir, VIEWER_TIMEOUT, read_image, unique_instance,
+        write_animated_gif, write_image,
     };
 
     fn strs(args: &[&str]) -> Vec<OsString> {
@@ -1354,12 +1354,19 @@ mod tests {
         }
     }
 
+    /// A WARP device and a swap chain shown in `window`'s composition, as
+    /// `start` makes them. A swap chain that presents without being shown
+    /// keeps its frames waiting, and releasing its device then waits for
+    /// them for ever on a machine without a GPU.
     fn graphics(window: &Window) -> Graphics {
         let device = Device::warp().unwrap();
+        let swap_chain = SwapChain::new(&device, window.client_size()).unwrap();
+        let composition = Composition::new(window.hwnd()).unwrap();
+        composition.show(&swap_chain).unwrap();
         Graphics {
-            swap_chain: SwapChain::new(&device, window.client_size()).unwrap(),
+            swap_chain,
             device,
-            composition: Composition::new(window.hwnd()).unwrap(),
+            composition,
         }
     }
 
@@ -1371,6 +1378,25 @@ mod tests {
             dark: true,
         };
         App::new(config, Box::new(DiskFiles), Instant::now())
+    }
+
+    /// The worker's next output, failing the test if none comes in time.
+    fn next_output(worker: &Worker) -> Output {
+        worker
+            .recv_timeout(VIEWER_TIMEOUT)
+            .expect("the decode worker answers in time")
+    }
+
+    /// Waits for the hardware device's thread to finish, failing the test if
+    /// it takes too long.
+    fn wait_for_device(viewer: &mut Viewer) {
+        let thread = viewer.upgrade.as_mut().unwrap().thread.take().unwrap();
+        let deadline = Instant::now() + VIEWER_TIMEOUT;
+        while !thread.is_finished() {
+            assert!(Instant::now() < deadline, "the device never came");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        thread.join().unwrap();
     }
 
     fn key(key: Key) -> Input {
@@ -1477,14 +1503,14 @@ mod tests {
             ErrorCode::FileNotFound
         );
         let image = viewer.awaited().unwrap();
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         assert_eq!(viewer.bitmap_sizes[&image], PixelSize::new(400, 300));
         assert!(viewer.awaited().is_none());
         assert!(viewer.pixels.contains_key(&image));
         viewer.paint();
         // The app asks for the full decode once the preview is shown.
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         assert_eq!(viewer.bitmap_sizes[&image], PixelSize::new(640, 480));
         viewer.resize(PixelSize::new(200, 100));
@@ -1496,15 +1522,7 @@ mod tests {
         viewer.timer(SHOW_TIMER);
         viewer.timer(99);
         // Wait for the device thread, then move to its device.
-        viewer
-            .upgrade
-            .as_mut()
-            .unwrap()
-            .thread
-            .take()
-            .unwrap()
-            .join()
-            .unwrap();
+        wait_for_device(&mut viewer);
         viewer.device_ready();
         assert!(viewer.upgrade.is_none() && viewer.pixels.is_empty());
         assert_eq!(viewer.bitmaps.len(), 1);
@@ -1551,11 +1569,11 @@ mod tests {
         });
         // The shown image decodes first; its neighbour is held back until
         // decoding ahead starts.
-        let first = viewer.worker.recv().unwrap();
+        let first = next_output(&viewer.worker);
         let animated = first.image;
         viewer.accept(first);
         viewer.start_prefetching();
-        let second = viewer.worker.recv().unwrap();
+        let second = next_output(&viewer.worker);
         let vector = second.image;
         viewer.accept(second);
         assert_eq!(viewer.animations[&animated].frames.len(), 2);
@@ -1567,15 +1585,7 @@ mod tests {
         assert_eq!(viewer.animations[&animated].playback.frame(), 1);
         viewer.input(key(Key::Right));
 
-        viewer
-            .upgrade
-            .as_mut()
-            .unwrap()
-            .thread
-            .take()
-            .unwrap()
-            .join()
-            .unwrap();
+        wait_for_device(&mut viewer);
         viewer.device_ready();
         assert!(viewer.upgrade.is_none());
         assert_eq!(viewer.animations[&animated].playback.frame(), 1);
@@ -1609,7 +1619,7 @@ mod tests {
             id: COMMAND_LINE,
             request: open_request(&[path], true),
         });
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         assert!(viewer.awaited().is_none());
         assert_eq!(viewer.first_error.as_ref().unwrap().exit_code(), 4);
@@ -1674,14 +1684,14 @@ mod tests {
             request: open_request(std::slice::from_ref(&path), false),
         });
         let image = viewer.app.set().selected().unwrap();
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         viewer.watcher.start();
 
         // A rewrite of the same size replaces the bitmap.
         write_image(&path, &Pixels::solid(40, 30, Rgba::RED), Format::Png).unwrap();
         reload(&mut viewer, image);
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         assert!(!viewer.reloads.contains(image));
         let shot = dir.join("shot.png");
@@ -1691,7 +1701,7 @@ mod tests {
         // A half-written file is retried, and the old image stays.
         std::fs::write(&path, b"\x89PNG half").unwrap();
         reload(&mut viewer, image);
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         assert!(viewer.reloads.contains(image));
         assert_eq!(listed(&mut viewer).images[0].state, LoadState::Preview);
@@ -1709,7 +1719,7 @@ mod tests {
         viewer.bitmaps.clear();
         std::fs::write(&path, b"not an image").unwrap();
         reload(&mut viewer, image);
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         assert_eq!(listed(&mut viewer).images[0].state, LoadState::Failed);
 
@@ -1743,7 +1753,7 @@ mod tests {
             id: COMMAND_LINE,
             request: open_request(&[path], false),
         });
-        let output = viewer.worker.recv().unwrap();
+        let output = next_output(&viewer.worker);
         viewer.accept(output);
         // Focus passes to the field only while it is shown.
         viewer.focus();
@@ -1823,7 +1833,7 @@ mod tests {
         // The neighbour's decode waits for the first frame, as at start-up.
         viewer.start_prefetching();
         while viewer.bitmaps.len() < 2 {
-            let output = viewer.worker.recv().unwrap();
+            let output = next_output(&viewer.worker);
             viewer.accept(output);
         }
         assert!(!viewer.graphics.device.is_lost());
@@ -1843,7 +1853,7 @@ mod tests {
         assert!(viewer.bitmaps.is_empty() && viewer.pixels.is_empty());
         assert!(viewer.animations.is_empty());
         while viewer.bitmaps.len() < 2 {
-            let output = viewer.worker.recv().unwrap();
+            let output = next_output(&viewer.worker);
             viewer.accept(output);
         }
         // The animation comes back with its decode, on the new device.

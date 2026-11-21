@@ -37,7 +37,10 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
+      # The tests take a few minutes; a hang fails the run instead of holding
+      # the runner for hours.
       - name: Test with coverage
+        timeout-minutes: 20
         run: cargo llvm-cov --all-targets --ignore-filename-regex 'src[\\/]bin[\\/]' --fail-under-lines 75
 
       # Runners have no GPU and vary widely, so the numbers are printed, not
