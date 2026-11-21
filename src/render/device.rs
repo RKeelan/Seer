@@ -114,6 +114,14 @@ impl Device {
         self.warp
     }
 
+    /// Whether the device has been lost, as when the graphics driver is
+    /// updated or restarts, or the adapter is removed. A lost device draws
+    /// nothing again; everything made on it must be made again on a new one.
+    pub fn is_lost(&self) -> bool {
+        // SAFETY: GetDeviceRemovedReason has no arguments.
+        unsafe { self.d3d.GetDeviceRemovedReason() }.is_err()
+    }
+
     /// A bitmap holding a decoded image.
     pub fn create_bitmap(&self, decoded: &Decoded) -> Result<ID2D1Bitmap1> {
         let size = decoded.bitmap_size;
@@ -336,6 +344,7 @@ mod tests {
     fn devices_are_created_with_a_warp_fallback() {
         let device = Device::new().unwrap();
         let _ = device.is_warp();
+        assert!(!device.is_lost());
         assert!(Device::warp().unwrap().is_warp());
         if let Ok(d3d) = hardware_device() {
             assert!(!Device::from_hardware(d3d).unwrap().is_warp());

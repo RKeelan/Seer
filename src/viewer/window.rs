@@ -9,8 +9,8 @@ use std::cell::RefCell;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ScreenToClient,
-    ValidateRect,
+    GetMonitorInfoW, HBRUSH, HDC, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    ScreenToClient, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
@@ -26,13 +26,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
     GetWindowTextW, HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZEWE, IsIconic,
     KillTimer, LoadCursorW, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SetCursor, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_OVERLAPPEDWINDOW,
+    SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE,
+    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -84,6 +84,12 @@ pub trait Handler {
     fn theme_changed(&mut self) {}
     /// Watched files have changed.
     fn files_changed(&mut self) {}
+    /// A child edit control, such as the note field, is about to paint with
+    /// `hdc`. Returns the brush for its background, having set its colours
+    /// in `hdc`, or `None` for the system's colours.
+    fn control_colours(&mut self, _hdc: HDC, _control: HWND) -> Option<HBRUSH> {
+        None
+    }
 }
 
 type Slot = RefCell<Option<Box<dyn Handler>>>;
@@ -503,6 +509,27 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             quit();
             return LRESULT(0);
         }
+        // Moved to a monitor with a different scale: take the size Windows
+        // suggests for it, which keeps the window the same size to the eye.
+        // This happens before the handler is reached, so that the resize it
+        // causes reaches the handler too.
+        WM_DPICHANGED if lparam.0 != 0 => {
+            // SAFETY: WM_DPICHANGED's lParam points to the suggested window
+            // rectangle, valid for the message.
+            let r = unsafe { *(lparam.0 as *const RECT) };
+            // SAFETY: the window is live.
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
         _ => {}
     }
     // A message that arrives while the handler is busy, such as one sent by a
@@ -534,6 +561,13 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 WM_CLOSE => handler.input(Input::CloseWindow),
                 WM_SETTINGCHANGE if theme::is_theme_change(lparam) => handler.theme_changed(),
                 WM_SETFOCUS => handler.focus(),
+                WM_DPICHANGED => handler.input(Input::Dpi {
+                    dpi: (wparam.0 & 0xFFFF) as u32,
+                }),
+                WM_CTLCOLOREDIT => {
+                    let brush = handler.control_colours(HDC(wparam.0 as _), HWND(lparam.0 as _))?;
+                    return Some(LRESULT(brush.0 as isize));
+                }
                 WM_COMMAND if ((wparam.0 >> 16) & 0xFFFF) as u32 == EN_CHANGE => {
                     let text = note::text(HWND(lparam.0 as _));
                     handler.input(Input::NoteText { text });
@@ -612,6 +646,10 @@ mod tests {
         }
         fn theme_changed(&mut self) {
             self.push("theme".into());
+        }
+        fn control_colours(&mut self, _: HDC, _: HWND) -> Option<HBRUSH> {
+            self.push("colours".into());
+            Some(HBRUSH(7 as _))
         }
     }
 
@@ -701,6 +739,58 @@ mod tests {
         send(&window, WM_SETTINGCHANGE, 0, colour.as_ptr() as isize);
         theme::set_title_bar(window.hwnd(), true);
         theme::set_title_bar(window.hwnd(), false);
+    }
+
+    #[test]
+    fn a_change_of_scale_resizes_the_window_and_reaches_the_handler() {
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        let window = Window::create(PixelRect::new(10, 10, 320, 200), "test").unwrap();
+        let log = Rc::new(RefCell::new(Log::default()));
+        window.set_handler(Box::new(Recorder(Rc::clone(&log))));
+        let suggested = RECT {
+            left: 20,
+            top: 20,
+            right: 520,
+            bottom: 420,
+        };
+        let pointer = &raw const suggested as isize;
+        send(&window, WM_DPICHANGED, (144 << 16) | 144, pointer);
+        let log = log.borrow();
+        assert!(
+            log.0.iter().any(|entry| entry.starts_with("resize ")),
+            "{:?}",
+            log.0
+        );
+        assert_eq!(log.0.last().unwrap(), r#"{"type":"dpi","dpi":144}"#);
+        let mut frame = RECT::default();
+        // SAFETY: the pointer is to a live local.
+        unsafe { GetWindowRect(window.hwnd(), &mut frame) }.unwrap();
+        assert_eq!(frame, suggested);
+    }
+
+    #[test]
+    fn edit_controls_paint_in_the_handler_s_colours() {
+        let window = Window::create(PixelRect::new(10, 10, 320, 200), "test").unwrap();
+        let sent = |window: &Window| {
+            // SAFETY: the window is live; the message is handled
+            // synchronously.
+            unsafe {
+                SendMessageW(
+                    window.hwnd(),
+                    WM_CTLCOLOREDIT,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(0)),
+                )
+            }
+        };
+        // Without colours from the handler the system's apply.
+        window.set_handler(Box::new(Defaults));
+        assert_ne!(sent(&window), LRESULT(7));
+        let log = Rc::new(RefCell::new(Log::default()));
+        window.set_handler(Box::new(Recorder(Rc::clone(&log))));
+        assert_eq!(sent(&window), LRESULT(7));
+        assert_eq!(log.borrow().0, ["colours"]);
     }
 
     #[test]

@@ -189,6 +189,11 @@ pub enum Input {
         /// The image.
         image: ImageId,
     },
+    /// The graphics device was lost, and every decoded image with it. Those
+    /// the shown images and the selection's neighbours need are decoded
+    /// again; the rest stay unloaded until they are needed.
+    #[serde(skip)]
+    DeviceLost,
 }
 
 /// What the window must do on the state machine's behalf.
@@ -519,6 +524,17 @@ pub const NOTE_PROMPT: &str = "Note: Enter keeps, Escape discards";
 /// scale.
 pub const NOTE_PADDING: f64 = 6.0;
 
+/// The note field's fill and text colours, in the dark theme or the light.
+/// The scene draws the field's box in them, and the window gives its text
+/// control the same, so the two look like one field.
+pub const fn note_colours(dark: bool) -> (Colour, Colour) {
+    if dark {
+        (DARK_FIELD, DARK_TEXT)
+    } else {
+        (WHITE, LIGHT_TEXT)
+    }
+}
+
 /// How long the zoom readout takes to fade in.
 const READOUT_FADE_IN: Duration = Duration::from_millis(150);
 /// How long after the last zoom change the readout starts to fade out.
@@ -539,6 +555,7 @@ const LIGHT_BACKGROUND: Colour = Colour::rgb(243, 243, 243);
 const LIGHT_TEXT: Colour = Colour::rgb(28, 28, 28);
 const DARK_STRIP: Colour = Colour::rgb(43, 43, 43);
 const LIGHT_STRIP: Colour = Colour::rgb(232, 232, 232);
+const DARK_FIELD: Colour = Colour::rgb(45, 45, 45);
 const ACCENT: Colour = Colour::rgb(0, 103, 192);
 const WHITE: Colour = Colour::rgb(255, 255, 255);
 const BLACK: Colour = Colour::rgb(0, 0, 0);
@@ -798,6 +815,11 @@ impl App {
         !self.waiters.is_empty()
     }
 
+    /// Whether the viewer is in the dark theme.
+    pub fn dark(&self) -> bool {
+        self.dark
+    }
+
     fn apply(&mut self, input: Input, effects: &mut Vec<Effect>) {
         match input {
             Input::Key { key, modifiers } => self.key(key, modifiers, effects),
@@ -854,6 +876,26 @@ impl App {
                 if let Some(state) = self.images.get_mut(&image) {
                     state.missing = true;
                 }
+            }
+            Input::DeviceLost => self.device_lost(),
+        }
+    }
+
+    /// Forgets every decoded image and thumbnail, as if evicted. A decode
+    /// still under way is left to finish, since its pixels are not on the
+    /// device.
+    fn device_lost(&mut self) {
+        for (image, state) in &mut self.images {
+            if matches!(state.state, LoadState::Preview | LoadState::Loaded) {
+                state.state = LoadState::Loading;
+                if state.pending.is_none() {
+                    state.full_requested = false;
+                }
+                self.cache.forget(*image);
+            }
+            // The strip asks again for the thumbnails it shows.
+            if state.thumbnail.is_some() {
+                state.thumbnail_requested = false;
             }
         }
     }
@@ -2183,9 +2225,10 @@ impl App {
         }
 
         if let (Some(field), Some(note)) = (self.note_field(), &self.note) {
+            let (fill, ink) = note_colours(self.dark);
             items.push(Item::FillRect {
                 rect: field,
-                colour: WHITE,
+                colour: fill,
             });
             items.push(Item::StrokeRect {
                 rect: field,
@@ -2195,9 +2238,9 @@ impl App {
             });
             let padding = NOTE_PADDING * scale;
             let (words, colour) = if note.text.is_empty() {
-                (NOTE_PROMPT.to_string(), LIGHT_TEXT.with_alpha(0.5))
+                (NOTE_PROMPT.to_string(), ink.with_alpha(0.5))
             } else {
-                (note.text.clone(), LIGHT_TEXT)
+                (note.text.clone(), ink)
             };
             items.push(Item::Text {
                 text: words,
@@ -3131,6 +3174,49 @@ mod session_tests {
     }
 
     #[test]
+    fn a_lost_device_decodes_again_only_what_is_needed() {
+        let mut session = Session::new();
+        let fit = DecodeTarget::Fit { within: WINDOW };
+        let paths = [r"C:\1.png", r"C:\2.png", r"C:\3.png", r"C:\4.png"];
+        session.open_with(&paths, None, false);
+        for image in [1, 2, 4] {
+            session.decode(image, 100, 100);
+        }
+        session.send(Input::Decoded {
+            image: ImageId(1),
+            target: DecodeTarget::Thumbnail {
+                at_most: PixelSize::new(64, 48),
+            },
+            size: PixelSize::new(100, 100),
+        });
+        // 3 has a preview decode under way.
+        session.key(Key::Right);
+        assert_eq!(
+            states(&mut session),
+            [
+                LoadState::Loaded,
+                LoadState::Loaded,
+                LoadState::Loading,
+                LoadState::Loaded
+            ]
+        );
+        let effects = session.send(Input::DeviceLost);
+        // 2 is shown and 1 next to it; 3's decode is still under way, and 4
+        // stays unloaded until it is needed.
+        assert_eq!(
+            decodes(&effects),
+            Decodes {
+                asked: vec![(2, fit, false), (1, fit, true)],
+                cancelled: vec![],
+                evicted: vec![],
+            }
+        );
+        assert_eq!(states(&mut session), [LoadState::Loading; 4]);
+        // Only the thumbnail that had been decoded is asked for again.
+        assert_eq!(thumbnails_asked(&effects), [1]);
+    }
+
+    #[test]
     fn images_beyond_the_budget_are_evicted_least_recently_shown_first() {
         let mut session = Session::new();
         // Each full decode below takes 100 × 100 × 4 bytes.
@@ -3331,6 +3417,31 @@ mod session_tests {
         session.key(Key::Delete);
         session.key_with(Key::Char('w'), Modifiers::CTRL);
         assert!(session.list().images.is_empty());
+    }
+
+    #[test]
+    fn the_note_field_follows_the_theme() {
+        let mut session = three_images();
+        session.drag(Button::Right, (300.0, 200.0), (100.0, 100.0));
+        let field = Rect::new(308.0, 100.0, 240.0, 28.0);
+        let fill = |session: &Session| {
+            session
+                .app
+                .scene()
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::FillRect { rect, colour } if *rect == field => Some(*colour),
+                    _ => None,
+                })
+        };
+        assert!(session.app.dark());
+        assert_eq!(fill(&session), Some(note_colours(true).0));
+        let effects = session.send(Input::Theme { dark: false });
+        assert!(effects.contains(&Effect::Redraw));
+        assert!(!session.app.dark());
+        assert_eq!(fill(&session), Some(note_colours(false).0));
+        assert_ne!(note_colours(true), note_colours(false));
     }
 
     #[test]

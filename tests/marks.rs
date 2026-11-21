@@ -159,10 +159,11 @@ fn marks_are_reported_in_image_pixels_at_any_zoom_and_rotation() {
 
     // Fitted at 50%, the image covers the client area.
     drag(&viewer, (16.0, 12.0), (48.0, 36.0));
-    // The note field shows over the image, beside the box.
+    // The note field shows over the image, beside the box, in the dark
+    // theme a headless viewer always has.
     let shot = screenshot(&viewer, &dir);
     assert!(
-        near(shot.get(100, 14), Rgba::WHITE),
+        near(shot.get(100, 14), Rgba::opaque(45, 45, 45)),
         "{:?}",
         shot.get(100, 14)
     );
