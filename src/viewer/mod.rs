@@ -162,11 +162,14 @@ fn start(args: &RunArgs) -> Result<u8> {
         let hwnd = Arc::clone(&hwnd);
         Worker::spawn(move || window::post(hwnd.load(Ordering::Acquire), WM_DECODED))
     };
+    // A headless viewer is always dark, so its screenshots do not depend on
+    // the machine's setting.
+    let dark = args.headless || theme::apps_dark();
     let config = Config {
         headless: args.headless,
         size: PixelSize::new(placement.width, placement.height),
         dpi: window::system_dpi(),
-        dark: true,
+        dark,
     };
     let mut app = App::new(config, Box::new(DiskFiles), Instant::now());
     // The decodes start at once; everything else waits for the window.
@@ -194,6 +197,7 @@ fn start(args: &RunArgs) -> Result<u8> {
     }
 
     let window = Window::create(placement, &app.title())?;
+    theme::set_title_bar(window.hwnd(), dark);
     hwnd.store(window.hwnd().0 as isize, Ordering::Release);
     timings.mark("window_created");
     let composition = Composition::new(window.hwnd())?;
@@ -814,6 +818,15 @@ impl Handler for Viewer {
             note.focus();
         }
     }
+
+    fn theme_changed(&mut self) {
+        if self.visibility == Visibility::Never {
+            return;
+        }
+        let dark = theme::apps_dark();
+        theme::set_title_bar(self.hwnd, dark);
+        self.input(Input::Theme { dark });
+    }
 }
 
 /// Lets a GUI-subsystem process print to the console it was started from.
@@ -1149,5 +1162,39 @@ mod tests {
         viewer.input(key(Key::Enter));
         assert!(!viewer.note.as_ref().unwrap().is_shown());
         assert_eq!(viewer.app.marks().iter().next().unwrap().note, "typed");
+    }
+
+    #[test]
+    fn a_shown_viewer_follows_the_colour_setting_and_a_headless_one_does_not() {
+        let window = Window::create(PixelRect::new(0, 0, 100, 100), "theme").unwrap();
+        let (_events, received) = mpsc::channel();
+        let mut light = app(&window, false);
+        light.handle(Input::Theme { dark: false }, Instant::now());
+        let mut viewer = Viewer::new(
+            window.hwnd(),
+            light,
+            graphics(&window),
+            Worker::spawn(|| {}),
+            None,
+            Timings::start(),
+            received,
+        );
+        let light = viewer.app.scene().background;
+        viewer.theme_changed();
+        assert_eq!(viewer.app.scene().background, light);
+
+        viewer.visibility = Visibility::Hidden {
+            activate: false,
+            waited: false,
+        };
+        viewer.theme_changed();
+        let mut expected = app(&window, false);
+        expected.handle(
+            Input::Theme {
+                dark: theme::apps_dark(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(viewer.app.scene().background, expected.scene().background);
     }
 }

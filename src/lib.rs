@@ -13,6 +13,7 @@ pub mod install;
 pub mod ipc;
 pub mod model;
 pub mod protocol;
+pub mod registry;
 pub mod render;
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;

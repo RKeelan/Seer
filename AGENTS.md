@@ -27,6 +27,10 @@ Never test against the developer's own viewer or show a window on their desktop.
 
 In Rust tests, `testutil::HeadlessViewer` does all of this: it starts a headless viewer on a unique instance, runs `seer` against it, waits for images to load, and quits it on drop. `tests/viewer.rs` shows its use.
 
+## Testing installation
+
+Never run `seer install` or `seer uninstall` while developing or testing: they change the user's real file associations and `PATH`. Test `install::install` and `install::uninstall` with an `install::Target` pointing at a `registry::TestRoot` (a throwaway key under `HKEY_CURRENT_USER\Software`, deleted on drop) and a temporary directory, as the tests in `src/install.rs` and `tests/install.rs` do.
+
 ## Public repository
 
 This repository is public.

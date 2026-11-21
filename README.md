@@ -8,11 +8,22 @@ Seer is a fast image viewer for Windows that shows the images it was asked to op
 
 Seer runs on Windows 11, x64. It is two programs: `seerw.exe` is the viewer, which owns the window, and `seer.exe` is the command line that drives it.
 
+### Installing
+
+Run `seer install` from wherever `seer.exe` and `seerw.exe` are. It installs Seer for the current user, without administrator rights:
+
+- It copies both programs to `%LOCALAPPDATA%\Programs\Seer` and adds that directory to your `PATH`, so terminals opened afterwards find `seer`.
+- It registers Seer for the image types it reads, so it appears in Explorer's Open with menu and in Settings > Apps > Default apps. It never makes itself the default: choose it there, or in Open with > Choose another app, for each type you want it to open.
+
+Installing again replaces the programs, even while the viewer is running; the running viewer keeps its old version until it is next started. `seer uninstall` removes the programs, the `PATH` entry and the registrations, and leaves other programs' registrations for the same types alone.
+
 - `seer --version` and `seerw --version` print the program's name and version.
 - `seerw <files…>` opens a window showing the first image, fitted to the window and never enlarged, with the others a key press away. A large image appears at window size first and sharpens once its full-resolution decode finishes. The title bar shows the image's file name and size in pixels.
 - `seerw` with no files starts the viewer empty. It shows its window once it has been sent an image and drawn it, or after a second with nothing to show.
 - `seerw --headless` runs the viewer without ever showing its window or taking the focus, for tests. It answers the command line like any viewer, and also accepts `seer debug input`.
 - `--no-activate` shows the window without taking the focus.
+
+The window follows Windows' light or dark setting for apps, title bar included, and switches when the setting changes. A headless viewer is always dark.
 
 Seer reads every still format the Windows Imaging Component can decode: JPEG, PNG, BMP, GIF (the first frame), TIFF, ICO and JPEG XR, plus WebP, HEIC, AVIF and JPEG XL when their codec extensions from the Microsoft Store are installed. An image whose codec is missing shows a message naming the extension to install. EXIF orientation is honoured. Colours are treated as sRGB; embedded colour profiles are ignored.
 
@@ -27,6 +38,7 @@ There is only ever one viewer window. The first `seerw.exe` to start owns it; an
 - `seer marks [--wait] [--timeout <seconds>] [--clear]` reports the marks the user has drawn: for each, its id, its image's id and path, its rectangle (`x`, `y`, `width`, `height` in the image's own pixels, whatever the zoom and rotation) and its note, in the order of the images and then the order the marks were made. `--wait` answers only once the user presses Ctrl+Enter, `--timeout` gives up after that many seconds (which may be fractional) with exit code 5, and `--clear` removes the marks once reported.
 - `seer screenshot <out.png>` saves what the window shows.
 - `seer quit` closes the viewer.
+- `seer install` and `seer uninstall` install and remove Seer for the current user (see [Installing](#installing)).
 
 Every command takes `--json`, which prints the result as JSON on stdout; errors then also appear there as `{"error":{"code":"…","message":"…"}}`. Relative paths are resolved against the current directory before they are sent.
 
@@ -37,7 +49,7 @@ Exit codes:
 - 0: success.
 - 1: unexpected failure.
 - 2: usage error.
-- 3: no viewer is running (every command except `open`).
+- 3: no viewer is running (every command except `open`, `install` and `uninstall`).
 - 4: one or more files could not be opened; the others were.
 - 5: `marks --wait` timed out.
 

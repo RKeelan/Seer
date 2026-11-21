@@ -27,6 +27,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::install;
 use crate::ipc::client::{self, Starting};
 use crate::ipc::instance::InstanceName;
 use crate::model::ImageId;
@@ -78,6 +79,12 @@ enum Command {
     },
     /// Close the viewer.
     Quit,
+    /// Install Seer for the current user: copy seer.exe and seerw.exe to
+    /// %LOCALAPPDATA%\Programs\Seer, add that directory to PATH, and register
+    /// Seer for its image types.
+    Install,
+    /// Undo `seer install`.
+    Uninstall,
     /// Commands for testing the viewer.
     #[command(hide = true, subcommand)]
     Debug(DebugCommand),
@@ -219,8 +226,16 @@ where
             return ErrorCode::Usage.exit_code();
         }
     };
-    match execute(&cli, context) {
-        Ok(reply) => report(&reply, cli.json, context),
+    let outcome = match cli.command {
+        Command::Install | Command::Uninstall => installation(&cli.command).map(|(json, text)| {
+            let out = if cli.json { json + "\n" } else { text };
+            let _ = context.out.write_all(out.as_bytes());
+            0
+        }),
+        _ => execute(&cli, context).map(|reply| report(&reply, cli.json, context)),
+    };
+    match outcome {
+        Ok(code) => code,
         Err(error) => {
             let _ = writeln!(context.err, "seer: {error}");
             if cli.json {
@@ -229,6 +244,28 @@ where
             error.exit_code()
         }
     }
+}
+
+/// Runs `install` or `uninstall` for the current user, returning the report
+/// as JSON and as text.
+fn installation(command: &Command) -> Result<(String, String)> {
+    let target = install::Target::for_user()?;
+    let (json, text) = if matches!(command, Command::Install) {
+        let source = std::env::current_exe()?
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let installed = install::install(&target, &source)?;
+        (to_json(&installed), install::describe_installed(&installed))
+    } else {
+        let uninstalled = install::uninstall(&target)?;
+        (
+            to_json(&uninstalled),
+            install::describe_uninstalled(&uninstalled),
+        )
+    };
+    install::announce();
+    Ok((json, text))
 }
 
 /// Sends the command's request and returns the viewer's reply.
@@ -293,6 +330,9 @@ fn build_request(command: &Command, input: &mut dyn Read) -> Result<Request> {
             path: absolute(path)?,
         },
         Command::Quit => Request::Quit,
+        Command::Install | Command::Uninstall => {
+            unreachable!("install and uninstall do not talk to the viewer")
+        }
         Command::Debug(DebugCommand::Input { events }) => Request::DebugInput {
             events: parse_events(events, input)?,
         },

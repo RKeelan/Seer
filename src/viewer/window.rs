@@ -30,15 +30,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE,
-    WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::error::Result;
 use crate::model::app::{Button, Cursor, Input, Key, Modifiers};
 use crate::model::geometry::{PixelRect, PixelSize, Point};
-use crate::viewer::note;
+use crate::viewer::{note, theme};
 
 /// Posted to the window when the decode worker has output ready.
 pub const WM_DECODED: u32 = WM_APP + 1;
@@ -76,6 +77,8 @@ pub trait Handler {
     }
     /// The window has the keyboard focus, and may pass it to a child.
     fn focus(&mut self) {}
+    /// The system's light or dark setting may have changed.
+    fn theme_changed(&mut self) {}
 }
 
 type Slot = RefCell<Option<Box<dyn Handler>>>;
@@ -523,6 +526,7 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     handler.timer(wparam.0);
                 }
                 WM_CLOSE => handler.input(Input::CloseWindow),
+                WM_SETTINGCHANGE if theme::is_theme_change(lparam) => handler.theme_changed(),
                 WM_SETFOCUS => handler.focus(),
                 WM_COMMAND if ((wparam.0 >> 16) & 0xFFFF) as u32 == EN_CHANGE => {
                     let text = note::text(HWND(lparam.0 as _));
@@ -600,6 +604,22 @@ mod tests {
         fn input(&mut self, input: Input) {
             self.push(serde_json::to_string(&input).unwrap());
         }
+        fn theme_changed(&mut self) {
+            self.push("theme".into());
+        }
+    }
+
+    /// A handler that keeps every default.
+    struct Defaults;
+
+    impl Handler for Defaults {
+        fn paint(&mut self) {}
+        fn resize(&mut self, _: PixelSize) {}
+        fn decoded(&mut self) {}
+        fn device_ready(&mut self) {}
+        fn requests(&mut self) {}
+        fn timer(&mut self, _: usize) {}
+        fn input(&mut self, _: Input) {}
     }
 
     fn pump() {
@@ -656,6 +676,24 @@ mod tests {
         );
         assert!(window.take_handler().is_some());
         assert!(window.take_handler().is_none());
+    }
+
+    #[test]
+    fn a_change_to_the_colour_setting_reaches_the_handler() {
+        let window = Window::create(PixelRect::new(10, 10, 320, 200), "test").unwrap();
+        let log = Rc::new(RefCell::new(Log::default()));
+        window.set_handler(Box::new(Recorder(Rc::clone(&log))));
+        let colour = HSTRING::from("ImmersiveColorSet");
+        let environment = HSTRING::from("Environment");
+        send(&window, WM_SETTINGCHANGE, 0, colour.as_ptr() as isize);
+        send(&window, WM_SETTINGCHANGE, 0, environment.as_ptr() as isize);
+        send(&window, WM_SETTINGCHANGE, 0, 0);
+        assert_eq!(log.borrow().0, ["theme"]);
+
+        window.set_handler(Box::new(Defaults));
+        send(&window, WM_SETTINGCHANGE, 0, colour.as_ptr() as isize);
+        theme::set_title_bar(window.hwnd(), true);
+        theme::set_title_bar(window.hwnd(), false);
     }
 
     #[test]
