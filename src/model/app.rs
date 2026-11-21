@@ -1111,7 +1111,16 @@ impl App {
         }
     }
 
+    /// A click selects the mark under it, and in the tiles layout the tile's
+    /// image too.
     fn click(&mut self, image: ImageId, at: Point) {
+        if self
+            .compare
+            .as_ref()
+            .is_some_and(|compare| compare.layout == CompareLayout::Tiles)
+        {
+            self.set.select(image);
+        }
         self.selected_mark = self.mark_at(image, at);
     }
 
@@ -3537,6 +3546,21 @@ mod session_tests {
             corners,
             [(4.0, 4.0), (404.0, 4.0), (4.0, 304.0), (404.0, 304.0)]
         );
+        // Clicking a tile selects its image; dragging one pans them all and
+        // leaves the selection alone.
+        session.down(Button::Left, 600.0, 400.0);
+        session.up(Button::Left, 600.0, 400.0);
+        assert_eq!(session.selected(), Some(4));
+        assert_eq!(session.list().compare, Some(CompareLayout::Tiles));
+        session.drag(Button::Left, (200.0, 100.0), (220.0, 100.0));
+        assert_eq!(session.selected(), Some(4));
+        // In the split view a click selects nothing, since the selected
+        // image is always the left one.
+        session.key(Key::Char('s'));
+        session.down(Button::Left, 700.0, 300.0);
+        session.up(Button::Left, 700.0, 300.0);
+        assert_eq!(session.selected(), Some(4));
+        session.key(Key::Char('s'));
         // Opening more of the group with --compare keeps compare view, and
         // five tiles take three columns.
         session.open_with(&[r"C:\5.png"], Some("many"), true);

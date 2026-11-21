@@ -67,7 +67,7 @@ Two hidden commands exist for testing:
 - Delete or Ctrl+W closes the shown image.
 - Dragging with the right button draws a mark. `M` toggles mark mode, in which a left drag draws too; `M` or Escape leaves it. Releasing opens a note field beside the box: Enter keeps the mark and Escape discards it. Click a mark or the note drawn above it to select it, Delete to remove it, and double-click either or press F2 to edit its note. A selected mark is drawn in blue rather than red. In a headless viewer, `seer debug input` types a note with a `note_text` event, and screenshots show the field.
 - Ctrl+Enter finishes marking, answering any agent waiting on `seer marks --wait`. While one waits, the title bar and a banner across the window say so, and the banner's Done button does the same as Ctrl+Enter.
-- When the shown image belongs to a group, `C` toggles compare view, which shows the group side by side with one shared zoom, pan and rotation. `S` switches between that and a split view, which draws the image and the next in its group over the same area, divided by a line you can drag.
+- When the shown image belongs to a group, `C` toggles compare view, which shows the group side by side with one shared zoom, pan and rotation, in a grid from four images up, each with its caption (or file name) beneath. The selected image's tile is outlined, and clicking a tile selects it. `S` switches between that and a split view, which draws the image and the next in its group over the same area, divided by a line you can drag, with each one's caption in its top corner. `open --compare` opens the group straight into compare view. In single view the caption shows in the title bar.
 
 ## Developing Seer
 
