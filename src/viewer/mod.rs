@@ -178,6 +178,16 @@ fn start(args: &RunArgs) -> Result<u8> {
         Ownership::Owner(mutex) => mutex,
         Ownership::HandedOff(code) => return Ok(code),
     };
+    if log::wanted(args.headless) {
+        log::init();
+    }
+    log::write(format_args!(
+        "{} started on instance {}{} with {} files",
+        crate::version_line(),
+        instance,
+        if args.headless { ", headless," } else { "" },
+        files.len()
+    ));
 
     let placement = window::default_placement();
     let hwnd = Arc::new(AtomicIsize::new(0));
@@ -281,6 +291,11 @@ fn start(args: &RunArgs) -> Result<u8> {
         let _ = writeln!(std::io::stdout(), "{report}");
         return Ok(viewer.first_error.as_ref().map_or(0, Error::exit_code));
     }
+    log::write(format_args!(
+        "first frame presented {:.0} ms after the process was created",
+        viewer.timings.ms(Instant::now())
+    ));
+    log::open();
     viewer.watcher.start();
     if let Some(physical) = physical_memory() {
         viewer.app.set_cache_budget(cache::budget(physical));
@@ -307,6 +322,7 @@ fn start(args: &RunArgs) -> Result<u8> {
     // Dropping the viewer answers any request it still holds with an error.
     drop(window.take_handler());
     server.stop(REPLY_TIMEOUT);
+    log::write(format_args!("exited"));
     Ok(0)
 }
 
@@ -1005,6 +1021,11 @@ impl Viewer {
     }
 
     fn failed(&mut self, image: ImageId, error: Error) {
+        log::write(format_args!(
+            "image {} could not be shown: {}",
+            image.0,
+            log::error(&error)
+        ));
         if self.app.set().selected() == Some(image) {
             self.first_error.get_or_insert(error.clone());
         }
@@ -1045,6 +1066,9 @@ impl Viewer {
     /// decodes the shown images and the selection's neighbours need, which
     /// show as they finish.
     fn recover(&mut self) -> Result<()> {
+        log::write(format_args!(
+            "the graphics device was lost; moving to a new one"
+        ));
         let device = if self.graphics.device.is_warp() {
             Device::warp()?
         } else {
@@ -1181,7 +1205,12 @@ impl Handler for Viewer {
     fn device_ready(&mut self) {
         // On failure the viewer stays on WARP, which draws the same frames
         // more slowly.
-        let _ = self.upgrade();
+        if let Err(error) = self.upgrade() {
+            log::write(format_args!(
+                "staying on WARP: the hardware device failed: {}",
+                log::error(&error)
+            ));
+        }
     }
 
     fn requests(&mut self) {

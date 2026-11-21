@@ -629,11 +629,15 @@ pub const VIEWER_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// It is ended with `seer quit` when dropped, never killed: coverage is
 /// collected only from processes that exit normally.
+///
+/// It logs to a temporary directory of its own, given to it as
+/// `SEER_LOG_DIR`, and removed once the viewer has exited.
 #[derive(Debug)]
 pub struct HeadlessViewer {
     instance: String,
     seer: PathBuf,
     process: Option<Child>,
+    logs: TempDir,
 }
 
 impl HeadlessViewer {
@@ -652,10 +656,28 @@ impl HeadlessViewer {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        Self::start_with_env(seerw, seer, args, &[])
+    }
+
+    /// [`HeadlessViewer::start_with`] with these environment variables set
+    /// for the viewer, such as `SEER_LOG_PATHS`.
+    pub fn start_with_env<I, S>(
+        seerw: &Path,
+        seer: &Path,
+        args: I,
+        env: &[(&str, &str)],
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let instance = unique_instance();
+        let logs = TempDir::new()?;
         let mut process = Command::new(seerw)
             .args(["--headless", "--instance", &instance])
             .args(args)
+            .env("SEER_LOG_DIR", logs.path())
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -668,9 +690,16 @@ impl HeadlessViewer {
             instance,
             seer: seer.to_owned(),
             process: Some(process),
+            logs,
         };
         connected?;
         Ok(viewer)
+    }
+
+    /// What the viewer has written to its log so far, or an empty string if
+    /// it has written nothing.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.logs.join("seerw.log")).unwrap_or_default()
     }
 
     /// The viewer's instance name.
