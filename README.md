@@ -17,8 +17,9 @@ Download the zip from the latest [release](https://github.com/RKeelan/Seer/relea
 - It copies both programs to `%LOCALAPPDATA%\Programs\Seer` and adds that directory to your `PATH`, so terminals opened afterwards find `seer`.
 - It registers Seer for the image types it reads, so it appears in Explorer's Open with menu and in Settings > Apps > Default apps. It never makes itself the default: choose it there, or in Open with > Choose another app, for each type you want it to open.
 - It registers the open verb so that Explorer hands a whole selection to one `seerw.exe` through COM. The images join the window in the folder's order, whatever it is sorted by, and the one that had the focus is selected. The COM class is a local server in `seerw.exe`, registered for the current user only.
+- It adds Seer, with its version, to Settings > Apps > Installed apps.
 
-Installing again replaces the programs, even while the viewer is running; the running viewer keeps its old version until it is next started. `seer uninstall` removes the programs, the `PATH` entry and the registrations, and leaves other programs' registrations for the same types alone. The directory the zip was unpacked to can then be deleted.
+Installing again replaces the programs, even while the viewer is running; the running viewer keeps its old version until it is next started. `seer uninstall`, or uninstalling Seer from Installed apps, removes the programs, the `PATH` entry and the registrations, and leaves other programs' registrations for the same types alone. The directory the zip was unpacked to can then be deleted.
 
 ### Opening images
 
@@ -143,6 +144,13 @@ CI runs on pull requests and on demand, on Windows.
 ### Releasing
 
 Versions are 0.x.y. To release, set the version in `Cargo.toml`, merge that change, and push a tag of the same version with a `v` in front, such as `v0.1.0`, on the merged commit. The release workflow (`.github/workflows/release.yml`) checks that the tag matches `Cargo.toml`, builds a release build, and publishes a GitHub release for the tag with `seer-<version>-x86_64-windows.zip`, which holds `seer.exe`, `seerw.exe`, `LICENSE` and `README.md`, and with notes generated from the pull requests since the previous release.
+
+Seer's winget package identifier is `RKeelan.Seer`. Its manifests install the release zip as a zip with a nested `exe` installer: winget unpacks the zip and runs `seer.exe install`, so a winget installation is the same as one made by hand, and winget recognises it, reads its version and uninstalls it through the entry `seer install` adds to Installed apps (`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\RKeelan.Seer`, which the manifests name as the `ProductCode`). Upgrading runs the new zip's `seer install` over the old installation, which works while the viewer is running.
+
+After the release, the workflow's `winget` job uses [Komac](https://github.com/russellbanks/Komac) to open a pull request to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) that adds the new version, copying the previous version's manifests there and updating the version, URL, hash, release date and release notes. It needs:
+
+- A classic personal access token with the `public_repo` scope, stored as the repository secret `WINGET_TOKEN`. Komac forks winget-pkgs to the token's owner and opens the pull request from that fork. Without the secret the job does nothing.
+- A version of `RKeelan.Seer` already in winget-pkgs to copy from. The first version must be submitted by hand, by opening a pull request to winget-pkgs with its manifests (`komac new` can write and submit them). Version 0.1.0's `seer install` does not add the Installed apps entry, so winget could install it but not find it afterwards; the first version submitted should be a later one.
 
 ## Licence
 
