@@ -209,6 +209,51 @@ fn opening_an_image_already_open_selects_it() {
 }
 
 #[test]
+fn a_folder_opens_its_images_in_explorers_order() {
+    let dir = TempDir::new().unwrap();
+    let shots = dir.join("shots");
+    std::fs::create_dir(&shots).unwrap();
+    std::fs::create_dir(shots.join("nested")).unwrap();
+    std::fs::write(shots.join("notes.txt"), "not an image").unwrap();
+    let (nested, _) = quadrants(&dir, r"shots\nested\inner.png", [Rgba::RED; 4]);
+    let (ten, _) = quadrants(&dir, r"shots\shot10.png", [Rgba::RED; 4]);
+    let (two, _) = quadrants(&dir, r"shots\shot2.png", [Rgba::GREEN; 4]);
+    let (one, _) = quadrants(&dir, r"shots\Shot1.png", [Rgba::BLUE; 4]);
+
+    // seerw expands a folder on its command line.
+    let viewer = viewer(&[&shots]);
+    let list = viewer.wait_for(|list| list.images.len() == 3);
+    let paths: Vec<_> = list.images.iter().map(|image| &image.path).collect();
+    assert_eq!(paths, [&one, &two, &ten]);
+    assert!(!paths.contains(&&nested));
+    assert_eq!(list.selected, Some(list.images[0].id));
+
+    // So does seer open, into a group.
+    let opened: OpenReply = viewer.seer_json([
+        Path::new("open"),
+        Path::new("--group"),
+        Path::new("run"),
+        &shots.join("nested"),
+    ]);
+    assert_eq!(opened.images.len(), 1);
+    assert_eq!(opened.images[0].path, nested);
+    let list = viewer.list();
+    assert_eq!(list.images[3].group.as_deref(), Some("run"));
+    assert_eq!(list.selected, Some(opened.images[0].id));
+
+    // A folder with no images fails to open.
+    let empty = dir.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let output = viewer.seer([Path::new("--json"), Path::new("open"), &empty]);
+    assert_eq!(output.status.code(), Some(4));
+    let reply: OpenReply = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(reply.images.is_empty());
+    assert_eq!(reply.failed[0].path, empty);
+    assert_eq!(reply.failed[0].error.code, seer::error::ErrorCode::NoImages);
+    assert_eq!(viewer.list().images.len(), 4);
+}
+
+#[test]
 fn images_are_closed_and_groups_cleared() {
     let dir = TempDir::new().unwrap();
     let paths: Vec<PathBuf> = ["a.png", "b.png", "c.png", "d.png"]

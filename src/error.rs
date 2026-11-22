@@ -30,6 +30,8 @@ pub enum ErrorCode {
     OpenFailed,
     /// The file does not exist.
     FileNotFound,
+    /// A folder given to open has no images in it that Seer reads.
+    NoImages,
     /// The file is not an image format Seer can show.
     UnsupportedFormat,
     /// The file's format needs a Windows codec extension that is not
@@ -70,6 +72,7 @@ impl ErrorCode {
             ErrorCode::NoViewer => 3,
             ErrorCode::OpenFailed
             | ErrorCode::FileNotFound
+            | ErrorCode::NoImages
             | ErrorCode::UnsupportedFormat
             | ErrorCode::CodecMissing
             | ErrorCode::DecodeFailed => 4,
@@ -155,6 +158,7 @@ mod tests {
         assert_eq!(ErrorCode::NoViewer.exit_code(), 3);
         assert_eq!(ErrorCode::OpenFailed.exit_code(), 4);
         assert_eq!(ErrorCode::FileNotFound.exit_code(), 4);
+        assert_eq!(ErrorCode::NoImages.exit_code(), 4);
         assert_eq!(ErrorCode::UnsupportedFormat.exit_code(), 4);
         assert_eq!(ErrorCode::CodecMissing.exit_code(), 4);
         assert_eq!(ErrorCode::DecodeFailed.exit_code(), 4);

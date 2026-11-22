@@ -1480,7 +1480,8 @@ impl App {
         let mut images = Vec::new();
         let mut failed = Vec::new();
         let mut chosen = None;
-        for (index, file) in files.into_iter().enumerate() {
+        let files = self.expand_folders(files, &mut failed);
+        for (index, file) in files {
             let canonical = match self.files.canonical(&file.path) {
                 Ok(canonical) => canonical,
                 Err(error) => {
@@ -1523,7 +1524,7 @@ impl App {
                     path: file.path.clone(),
                 });
             }
-            if select == Some(index) {
+            if select == Some(index) && chosen.is_none() {
                 chosen = Some(id);
             }
             images.push(OpenedImage {
@@ -1549,6 +1550,51 @@ impl App {
             });
         }
         Reply::Opened(OpenReply { images, failed })
+    }
+
+    /// Replaces each folder among the files to open with the images directly
+    /// in it, each paired with the index of the file it came from. A folder
+    /// that cannot be listed, has no images, or was given a caption, which
+    /// would not say which image it belongs to, goes in `failed`.
+    fn expand_folders(
+        &self,
+        files: Vec<OpenFile>,
+        failed: &mut Vec<OpenFailure>,
+    ) -> Vec<(usize, OpenFile)> {
+        let mut expanded = Vec::with_capacity(files.len());
+        for (index, file) in files.into_iter().enumerate() {
+            let listed = match self.files.folder_images(&file.path) {
+                None => {
+                    expanded.push((index, file));
+                    continue;
+                }
+                Some(_) if file.caption.is_some() => Err(Error::usage(format!(
+                    "{} is a folder, which cannot have a caption",
+                    file.path.display()
+                ))),
+                Some(Ok(images)) if images.is_empty() => Err(Error::new(
+                    ErrorCode::NoImages,
+                    format!("{} has no images Seer reads", file.path.display()),
+                )),
+                Some(listed) => listed,
+            };
+            match listed {
+                Ok(images) => expanded.extend(images.into_iter().map(|path| {
+                    (
+                        index,
+                        OpenFile {
+                            path,
+                            caption: None,
+                        },
+                    )
+                })),
+                Err(error) => failed.push(OpenFailure {
+                    path: file.path,
+                    error,
+                }),
+            }
+        }
+        expanded
     }
 
     fn list(&self) -> ListReply {
@@ -2615,6 +2661,24 @@ mod session_tests {
             (path.extension()? == "webp")
                 .then(|| Error::new(ErrorCode::CodecMissing, "needs the WebP codec"))
         }
+
+        /// A path ending in "folder" holds three images, one ending in
+        /// "empty" none, and one ending in "locked" cannot be listed.
+        fn folder_images(&self, path: &Path) -> Option<crate::Result<Vec<PathBuf>>> {
+            let name = path.file_name()?.to_string_lossy();
+            if name.ends_with("folder") {
+                Some(Ok(["1.png", "2.png", "10.png"]
+                    .iter()
+                    .map(|image| path.join(image))
+                    .collect()))
+            } else if name.ends_with("empty") {
+                Some(Ok(Vec::new()))
+            } else if name.ends_with("locked") {
+                Some(Err(Error::new(ErrorCode::OpenFailed, "access denied")))
+            } else {
+                None
+            }
+        }
     }
 
     const WINDOW: PixelSize = PixelSize::new(800, 600);
@@ -3077,6 +3141,107 @@ mod session_tests {
         // A file asked for that cannot be opened selects the first opened.
         session.request(open(&[r"C:\missing.png", r"C:\04.png"], Some(0)));
         assert_eq!(session.selected(), Some(4));
+    }
+
+    #[test]
+    fn a_folder_opens_the_images_in_it() {
+        let mut session = Session::new();
+        session.open(&[r"C:\shots\2.png"]);
+        let (opened, effects) = session.open_with(
+            &[r"C:\a.png", r"C:\shots\folder", r"C:\b.png"],
+            Some("run"),
+            false,
+        );
+        let paths: Vec<_> = opened.images.iter().map(|image| &image.path).collect();
+        assert_eq!(
+            paths,
+            [
+                r"C:\a.png",
+                r"C:\shots\folder\1.png",
+                r"C:\shots\folder\2.png",
+                r"C:\shots\folder\10.png",
+                r"C:\b.png",
+            ]
+            .map(PathBuf::from)
+            .iter()
+            .collect::<Vec<_>>()
+        );
+        assert!(opened.failed.is_empty());
+        assert!(effects.contains(&Effect::Watch {
+            image: opened.images[3].id,
+            path: r"C:\shots\folder\10.png".into(),
+        }));
+        let list = session.list();
+        assert!(
+            list.images
+                .iter()
+                .all(|image| image.group.as_deref() == Some("run") || image.id == ImageId(1))
+        );
+        assert_eq!(session.selected(), Some(opened.images[0].id.0));
+
+        // The folder's first image is selected when the folder is asked for.
+        session.request(Request::Open {
+            files: vec![
+                OpenFile {
+                    path: r"C:\c.png".into(),
+                    caption: None,
+                },
+                OpenFile {
+                    path: r"C:\other\folder".into(),
+                    caption: None,
+                },
+            ],
+            group: None,
+            compare: false,
+            activate: false,
+            select: Some(1),
+        });
+        let list = session.list();
+        let selected = list
+            .images
+            .iter()
+            .find(|image| Some(image.id) == list.selected)
+            .unwrap();
+        assert_eq!(selected.path, PathBuf::from(r"C:\other\folder\1.png"));
+    }
+
+    #[test]
+    fn a_folder_without_images_fails_to_open() {
+        let mut session = Session::new();
+        let (opened, effects) =
+            session.open_with(&[r"C:\empty", r"C:\locked", r"C:\a.png"], None, false);
+        assert_eq!(opened.images.len(), 1);
+        let failures: Vec<_> = opened
+            .failed
+            .iter()
+            .map(|failure| (failure.path.clone(), failure.error.code))
+            .collect();
+        assert_eq!(
+            failures,
+            [
+                (PathBuf::from(r"C:\empty"), ErrorCode::NoImages),
+                (PathBuf::from(r"C:\locked"), ErrorCode::OpenFailed),
+            ]
+        );
+        assert!(effects.contains(&Effect::FlashTaskbar));
+
+        // A caption cannot say which of a folder's images it belongs to.
+        let (id, effects) = session.request(Request::Open {
+            files: vec![OpenFile {
+                path: r"C:\folder".into(),
+                caption: Some("all".into()),
+            }],
+            group: None,
+            compare: false,
+            activate: false,
+            select: None,
+        });
+        let Some(Ok(Reply::Opened(opened))) = reply(&effects, id) else {
+            panic!("an open reply");
+        };
+        assert!(opened.images.is_empty());
+        assert_eq!(opened.failed[0].error.code, ErrorCode::Usage);
+        assert_eq!(session.list().images.len(), 1);
     }
 
     #[test]
