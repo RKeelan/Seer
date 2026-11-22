@@ -105,7 +105,8 @@ struct OpenArgs {
     /// button.
     #[arg(long)]
     activate: bool,
-    /// The image files.
+    /// The image files. A folder stands for the images directly in it, in
+    /// the order Explorer sorts them by name.
     #[arg(required = true, value_name = "FILES")]
     files: Vec<PathBuf>,
 }
@@ -296,9 +297,16 @@ fn build_request(command: &Command, input: &mut dyn Read) -> Result<Request> {
                 .iter()
                 .enumerate()
                 .map(|(index, path)| {
+                    let caption = open.captions.get(index).cloned();
+                    if caption.is_some() && path.is_dir() {
+                        return Err(Error::usage(format!(
+                            "{} is a folder, which cannot have a caption",
+                            path.display()
+                        )));
+                    }
                     Ok(OpenFile {
                         path: absolute(path)?,
-                        caption: open.captions.get(index).cloned(),
+                        caption,
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -672,6 +680,7 @@ mod tests {
             &["marks", "--timeout", "5"],
             &["marks", "--wait", "--timeout", "soon"],
             &["open", "--caption", "a", "--caption", "b", "x.png"],
+            &["open", "--caption", "a", "."],
             &["--instance", "bad name", "list"],
             &["debug", "input", "{\"type\":\"dance\"}"],
             &["debug", "input", "not json"],

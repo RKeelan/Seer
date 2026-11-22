@@ -27,6 +27,7 @@ Double-click an image in Explorer, or select several and press Enter, once Seer 
 
 - `seer --version` and `seerw --version` print the program's name and version.
 - `seerw <files…>` opens a window showing the first image, fitted to the window and never enlarged, with the others a key press away. A large image appears at window size first and sharpens once its full-resolution decode finishes. The title bar shows the image's file name and size in pixels.
+- A folder given to `seerw` or `seer open` stands for the images directly in it, which open in the order Explorer sorts them by name (so `shot2.png` comes before `shot10.png`). Files Seer does not read, hidden files and subfolders are left out. The folder is listed once, when it is opened: images added to it later do not join the window. A folder with no images fails with `no_images`, and a folder cannot have a `--caption`. A folder in a selection opened from Explorer is left out.
 - While an image is shown, the images either side of it are decoded in the background, so moving to one shows it at once. Decoded images are kept in memory up to a quarter of the machine's memory, at most 2 GB; beyond that, those shown longest ago are dropped and decoded again when needed. Images further away are not decoded until they are near the one shown.
 - With more than one image open, a strip of thumbnails along the bottom of the window shows them all in order, the shown one outlined, and each group bracketed under its name. The strip scrolls to keep the shown image in view; the wheel over it scrolls it, and clicking a thumbnail shows that image. Thumbnails are decoded on a thread of their own at background priority, so they never hold up the shown image, and only those the strip shows are decoded. They are small, so they are kept for as long as their image is open.
 - `seerw` with no files starts the viewer empty. It shows its window once it has been sent an image and drawn it, or after a second with nothing to show.
@@ -43,13 +44,13 @@ Animated GIFs play while they are shown, and pause when they are not. As in a br
 
 SVG files are drawn as vectors, so they stay sharp at any zoom. Their size in pixels, which `seer list` reports, is the root element's `width` and `height`, or its `viewBox` where those are missing or not plain numbers, or 300 × 150.
 
-When an open image's file is written, Seer reloads it once the writing stops, keeping the zoom, position, rotation and marks; if the size changed, the same relative point stays in the middle. A file that is locked or only partly written is tried again after a short wait, and the old image stays on screen meanwhile. Until the new file is decoded, `seer list` reports the image as `preview`. An image that is neither shown nor next to the one shown is reloaded only once it is. A deleted file stays open showing its last image, and `seer list` reports it as missing. Seer closes each file once it has read it, so it never stops another program from writing or deleting it, and it watches only the open files, through change notifications on their folders; it never lists a folder.
+When an open image's file is written, Seer reloads it once the writing stops, keeping the zoom, position, rotation and marks; if the size changed, the same relative point stays in the middle. A file that is locked or only partly written is tried again after a short wait, and the old image stays on screen meanwhile. Until the new file is decoded, `seer list` reports the image as `preview`. An image that is neither shown nor next to the one shown is reloaded only once it is. A deleted file stays open showing its last image, and `seer list` reports it as missing. Seer closes each file once it has read it, so it never stops another program from writing or deleting it, and it watches only the open files, through change notifications on their folders.
 
 ### The command line
 
 There is only ever one viewer window. The first `seerw.exe` to start owns it; any later one hands its files to the first, brings its window to the front, and exits. Many started at once all end up in the one window, in the order they reach it. `seer.exe` talks to the viewer over a named pipe that only the current user can open and that refuses connections from other machines.
 
-- `seer open [--group G] [--caption C]… [--compare] [--activate] <files…>` adds images to the window, starting the viewer if none is running, and reports the id given to each. The nth `--caption` belongs to the nth file. Without `--activate` the window does not take the focus: a running viewer flashes its taskbar button, and a new one shows behind the active window.
+- `seer open [--group G] [--caption C]… [--compare] [--activate] <files…>` adds images to the window, starting the viewer if none is running, and reports the id given to each. A folder opens the images in it, as above, each reported on its own. The nth `--caption` belongs to the nth file. Without `--activate` the window does not take the focus: a running viewer flashes its taskbar button, and a new one shows behind the active window.
 - `seer list` reports the open images (id, path, caption, group, size, load state and whether the file is missing), which one is selected, the zoom, the visible region and whether compare view is on. An image not decoded yet, or dropped from memory, is `loading` until it is near the one shown.
 - `seer close <id or path>…` removes images, and `seer close --all` removes them all. A bare number is an id; write `.\3` for a file named `3`. Naming an image that is not open is not an error: it is reported on stderr and in the JSON's `not_found`.
 - `seer clear <group>` removes a group's images.
@@ -76,7 +77,7 @@ An agent that wants the user's opinion of two renders might open them as a group
 {"error":{"code":"timeout","message":"marking was not finished within 30 seconds"}}
 ```
 
-The last exits with code 5. Error codes are stable names, such as `no_viewer`, `file_not_found`, `unsupported_format`, `codec_missing`, `decode_failed`, `usage` and `timeout`; `src/error.rs` lists them all.
+The last exits with code 5. Error codes are stable names, such as `no_viewer`, `file_not_found`, `no_images`, `unsupported_format`, `codec_missing`, `decode_failed`, `usage` and `timeout`; `src/error.rs` lists them all.
 
 `--instance <name>`, or the `SEER_INSTANCE` environment variable, picks which viewer to talk to (default `default`). Viewers on different instances are independent, which lets tests run without disturbing the viewer in use.
 
@@ -120,7 +121,7 @@ The log holds no file names unless the `SEER_LOG_PATHS` environment variable is 
 - SVG is drawn as Direct2D's SVG support draws it: no `<text>` elements, and only some of CSS.
 - WebP, HEIC, AVIF and JPEG XL need Windows' codec extensions from the Microsoft Store.
 - A pinch on a touchscreen does nothing; a touchpad pinch zooms.
-- Seer never opens a folder: only the files it is given.
+- Seer opens a folder's images only when the folder is given to it, never those of its subfolders, and does not add images that appear in the folder afterwards.
 
 ## Developing Seer
 

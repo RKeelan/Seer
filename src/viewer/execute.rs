@@ -71,7 +71,7 @@ pub fn parse_clsid(text: &str) -> Result<GUID> {
 #[derive(Debug)]
 pub struct Selection {
     /// The selection's files, in the folder view's order. Items with no file
-    /// system path, such as This PC, are left out.
+    /// system path, such as This PC, and folders are left out.
     pub files: Vec<PathBuf>,
     /// The index in `files` of the focused file.
     pub select: usize,
@@ -307,7 +307,12 @@ impl IExecuteCommand_Impl for Command_Impl {
         let items = self
             .selection()
             .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
-        let given = paths(&items)?;
+        // Opening a folder's images is for an explicit `seer open`; a folder
+        // in Explorer's selection is not opened.
+        let given = paths(&items)?
+            .into_iter()
+            .filter(|path| !path.is_dir())
+            .collect();
         let view = self.site().and_then(|site| view_order(&site));
         let chosen = in_view_order(given, view.as_deref().unwrap_or_default());
         // The viewer may have given up waiting; there is nothing more to do.
@@ -420,10 +425,13 @@ mod tests {
     fn executing_sends_the_selection_in_its_order() {
         let dir = TempDir::new().unwrap();
         let files = files(&dir, &["12.png", "14.png", "01.png", "b.jpg"]);
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let selected: Vec<_> = files.iter().cloned().chain([folder]).collect();
         let (command, sent, released) = command();
         let with_selection: IObjectWithSelection = command.cast().unwrap();
         // SAFETY: the array is a live object.
-        unsafe { with_selection.SetSelection(&shell_items(&files).unwrap()) }.unwrap();
+        unsafe { with_selection.SetSelection(&shell_items(&selected).unwrap()) }.unwrap();
         // SAFETY: the setters take plain values or null-terminated literals.
         unsafe {
             command.SetKeyState(0).unwrap();
@@ -440,7 +448,7 @@ mod tests {
         // SAFETY: the selection is asked for as the interface it is.
         let back: IShellItemArray = unsafe { with_selection.GetSelection() }.unwrap();
         // SAFETY: GetCount has no arguments.
-        assert_eq!(unsafe { back.GetCount() }.unwrap(), 4);
+        assert_eq!(unsafe { back.GetCount() }.unwrap(), 5);
 
         assert!(released.try_recv().is_err());
         drop((command, with_selection));

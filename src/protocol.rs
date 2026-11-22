@@ -39,7 +39,10 @@ pub enum Request {
     /// Add images to the set (`seer open`). An image already in the set is
     /// selected rather than added again.
     Open {
-        /// The files, in order, each with its optional caption.
+        /// The files, in order, each with its optional caption. A folder
+        /// stands for the images directly in it, in the order Explorer sorts
+        /// them by name; it cannot have a caption, and one with no images
+        /// fails with [`ErrorCode::NoImages`].
         files: Vec<OpenFile>,
         /// The group every file joins, if any.
         #[serde(default, skip_serializing_if = "Option::is_none")]

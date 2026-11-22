@@ -25,6 +25,13 @@ pub trait Files {
     fn missing_codec(&self, _path: &Path) -> Option<Error> {
         None
     }
+
+    /// If `path` names a folder, the images directly in it, in the order
+    /// Explorer sorts them by name, or the reason it cannot be listed. `None`
+    /// when `path` is not a folder.
+    fn folder_images(&self, _path: &Path) -> Option<Result<Vec<PathBuf>>> {
+        None
+    }
 }
 
 /// [`Files`] backed by the filesystem.
@@ -55,6 +62,73 @@ impl Files for DiskFiles {
     fn missing_codec(&self, path: &Path) -> Option<Error> {
         crate::decode::wic::missing_codec(path)
     }
+
+    fn folder_images(&self, path: &Path) -> Option<Result<Vec<PathBuf>>> {
+        path.is_dir().then(|| list_images(path))
+    }
+}
+
+/// The images directly in a folder: its files, other than hidden ones, whose
+/// extension is one Seer reads, sorted by name as Explorer sorts them, with
+/// runs of digits compared as numbers.
+fn list_images(folder: &Path) -> Result<Vec<PathBuf>> {
+    use std::os::windows::fs::MetadataExt;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    let unreadable = |error: io::Error| {
+        Error::new(
+            ErrorCode::OpenFailed,
+            format!("cannot list {}: {error}", folder.display()),
+        )
+    };
+    let mut images = Vec::new();
+    for entry in std::fs::read_dir(folder).map_err(unreadable)? {
+        let path = entry.map_err(unreadable)?.path();
+        // Following links, as opening the file would.
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file()
+            && metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN.0 == 0
+            && is_image_name(&path)
+        {
+            images.push(path);
+        }
+    }
+    images.sort_by(|a, b| compare_names(a, b));
+    Ok(images)
+}
+
+/// Whether a file's extension is one Seer reads: those it registers for, and
+/// SVG.
+fn is_image_name(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    crate::decode::svg::is_svg(path)
+        || crate::install::FAMILIES
+            .iter()
+            .flat_map(|family| family.extensions)
+            .any(|known| known[1..].eq_ignore_ascii_case(extension))
+}
+
+/// Compares two paths' file names as Explorer's name sort does.
+fn compare_names(a: &Path, b: &Path) -> std::cmp::Ordering {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::StrCmpLogicalW;
+    use windows::core::PCWSTR;
+
+    let wide = |path: &Path| -> Vec<u16> {
+        path.file_name()
+            .unwrap_or_default()
+            .encode_wide()
+            .chain([0])
+            .collect()
+    };
+    let (a, b) = (wide(a), wide(b));
+    // SAFETY: both are null-terminated and outlive the call.
+    let order = unsafe { StrCmpLogicalW(PCWSTR(a.as_ptr()), PCWSTR(b.as_ptr())) };
+    order.cmp(&0)
 }
 
 /// Normalises an absolute path without touching the disk: `/` becomes `\`,
@@ -356,6 +430,49 @@ mod tests {
         assert_eq!(directory.code, ErrorCode::OpenFailed);
         let invalid = DiskFiles.canonical(Path::new("C:\\bad\0name")).unwrap_err();
         assert_eq!(invalid.code, ErrorCode::OpenFailed);
+    }
+
+    #[test]
+    fn disk_files_list_a_folders_images_in_explorers_order() {
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+        use windows::core::HSTRING;
+
+        let dir = TempDir::new().unwrap();
+        for name in [
+            "img10.png",
+            "img2.JPG",
+            "Img1.svg",
+            "notes.txt",
+            "noextension",
+            "hidden.png",
+            "b.webp",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.join("sub.png")).unwrap();
+        std::fs::write(dir.join("sub.png").join("inner.png"), b"x").unwrap();
+        // SAFETY: the path is a live, null-terminated string.
+        unsafe {
+            SetFileAttributesW(
+                &HSTRING::from(dir.join("hidden.png").as_os_str()),
+                FILE_ATTRIBUTE_HIDDEN,
+            )
+        }
+        .unwrap();
+
+        let images = DiskFiles.folder_images(dir.path()).unwrap().unwrap();
+        let names: Vec<_> = images
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["b.webp", "Img1.svg", "img2.JPG", "img10.png"]);
+        assert_eq!(images[0], dir.join("b.webp"));
+
+        assert!(DiskFiles.folder_images(&dir.join("img2.JPG")).is_none());
+        assert!(DiskFiles.folder_images(&dir.join("missing")).is_none());
+        let empty = dir.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(DiskFiles.folder_images(&empty).unwrap().unwrap().is_empty());
     }
 
     #[test]
