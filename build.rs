@@ -1,7 +1,8 @@
 //! Embeds the application manifest and icon in both executables.
 //!
-//! The icon is drawn here rather than checked in: an open eye on a rounded
-//! blue square, simple enough to read at 16 pixels.
+//! The icon is drawn here rather than checked in: a teal scrying orb with a
+//! cream rim on a gold stand, on a transparent background, simple enough to
+//! read at 16 pixels.
 
 use std::env;
 use std::fs;
@@ -88,17 +89,17 @@ fn dib(size: u32) -> Vec<u8> {
     out
 }
 
-/// The icon's colour at one pixel, as straight BGRA, averaged
-/// over a 4×4 grid of samples for smooth edges.
+/// The icon's colour at one pixel, as straight BGRA, averaged over an 8×8
+/// grid of samples for smooth edges, including the stand's diagonal legs.
 fn pixel(size: u32, column: u32, row: u32) -> [u8; 4] {
-    const SAMPLES: u32 = 4;
+    const SAMPLES: u32 = 8;
     let mut sum = [0.0f32; 4];
     for sy in 0..SAMPLES {
         for sx in 0..SAMPLES {
-            // Map the sample to [-1, 1] across the icon.
-            let x =
-                ((column as f32 + (sx as f32 + 0.5) / SAMPLES as f32) / size as f32) * 2.0 - 1.0;
-            let y = ((row as f32 + (sy as f32 + 0.5) / SAMPLES as f32) / size as f32) * 2.0 - 1.0;
+            // Map the sample onto the 256-unit design grid.
+            let scale = GRID / size as f32;
+            let x = (column as f32 + (sx as f32 + 0.5) / SAMPLES as f32) * scale;
+            let y = (row as f32 + (sy as f32 + 0.5) / SAMPLES as f32) * scale;
             let [r, g, b, a] = sample(x, y);
             sum[0] += r * a;
             sum[1] += g * a;
@@ -123,39 +124,87 @@ fn pixel(size: u32, column: u32, row: u32) -> [u8; 4] {
     ]
 }
 
-/// The icon at a point in [-1, 1]², y downwards, as straight RGBA in [0, 1]:
-/// an open eye, white with a blue iris and a dark pupil, on a rounded
-/// square of deep blue.
+/// The width and height of the grid the icon is designed on.
+const GRID: f32 = 256.0;
+
+/// The icon at a point on the design grid, y downwards, as straight RGBA in
+/// [0, 1]: a scrying orb on a stand, with nothing behind it. The orb is a
+/// dark teal disc with a cream rim and a cream highlight arcing over its
+/// upper left. It sits on a gold stand: a rounded collar bar with two legs
+/// splayed out beneath it.
 fn sample(x: f32, y: f32) -> [f32; 4] {
-    const BACKGROUND: [f32; 4] = [0.09, 0.27, 0.52, 1.0];
-    const WHITE: [f32; 4] = [0.97, 0.98, 1.0, 1.0];
-    const IRIS: [f32; 4] = [0.20, 0.62, 0.93, 1.0];
-    const PUPIL: [f32; 4] = [0.05, 0.09, 0.17, 1.0];
+    const TEAL: [f32; 4] = opaque(0x0F3D3E);
+    const CREAM: [f32; 4] = opaque(0xF0E9CF);
+    const GOLD: [f32; 4] = opaque(0xD4A843);
 
-    // A rounded square with corner radius 0.3 filling the unit box.
-    let corner = 0.3;
-    let qx = (x.abs() - (1.0 - corner)).max(0.0);
-    let qy = (y.abs() - (1.0 - corner)).max(0.0);
-    if (qx * qx + qy * qy).sqrt() > corner {
-        return [0.0; 4];
+    // The orb is drawn over the stand.
+    const CENTRE: (f32, f32) = (128.0, 102.0);
+    const RIM_OUTER: f32 = 100.0;
+    const RIM_INNER: f32 = 88.0;
+    let (dx, dy) = (x - CENTRE.0, y - CENTRE.1);
+    let distance = (dx * dx + dy * dy).sqrt();
+    if distance <= RIM_OUTER {
+        return if distance < RIM_INNER {
+            if in_highlight(dx, dy, distance) {
+                CREAM
+            } else {
+                TEAL
+            }
+        } else {
+            CREAM
+        };
     }
 
-    // The eye is the lens where two circles overlap: its corners are at
-    // (±HALF_WIDTH, 0) and its lids reach ±HALF_HEIGHT.
-    const HALF_WIDTH: f32 = 0.8;
-    const HALF_HEIGHT: f32 = 0.5;
-    let radius = (HALF_WIDTH * HALF_WIDTH + HALF_HEIGHT * HALF_HEIGHT) / (2.0 * HALF_HEIGHT);
-    let centre = radius - HALF_HEIGHT;
-    let in_lid = |cy: f32| x * x + (y - cy) * (y - cy) <= radius * radius;
-    if !(in_lid(centre) && in_lid(-centre)) {
-        return BACKGROUND;
+    // The collar is a bar with fully rounded ends, centred on y = 202.
+    const COLLAR_LEFT: f32 = 66.0;
+    const COLLAR_RIGHT: f32 = 190.0;
+    const COLLAR_Y: f32 = 202.0;
+    const COLLAR_RADIUS: f32 = 14.0;
+    let cx = x.clamp(COLLAR_LEFT, COLLAR_RIGHT);
+    let in_collar = (x - cx).powi(2) + (y - COLLAR_Y).powi(2) <= COLLAR_RADIUS * COLLAR_RADIUS;
+
+    // Each leg is a quadrilateral running from under the collar down to the
+    // bottom edge; the right leg mirrors the left about x = 128.
+    const LEG: [(f32, f32); 4] = [(76.0, 204.0), (44.0, 252.0), (80.0, 252.0), (104.0, 210.0)];
+    let in_leg = in_polygon(&LEG, x, y) || in_polygon(&LEG, GRID - x, y);
+
+    if in_collar || in_leg { GOLD } else { [0.0; 4] }
+}
+
+/// An opaque colour given as `0xRRGGBB`, as straight RGBA in [0, 1].
+const fn opaque(rgb: u32) -> [f32; 4] {
+    [
+        ((rgb >> 16) & 0xFF) as f32 / 255.0,
+        ((rgb >> 8) & 0xFF) as f32 / 255.0,
+        (rgb & 0xFF) as f32 / 255.0,
+        1.0,
+    ]
+}
+
+/// Whether a point, given relative to the orb's centre, lies on the
+/// highlight: a quarter circle of radius 66 from due left to due up, stroked
+/// 18 wide with round caps.
+fn in_highlight(dx: f32, dy: f32, distance: f32) -> bool {
+    const RADIUS: f32 = 66.0;
+    const HALF_WIDTH: f32 = 9.0;
+    if dx <= 0.0 && dy <= 0.0 {
+        return (distance - RADIUS).abs() <= HALF_WIDTH;
     }
-    let distance = (x * x + y * y).sqrt();
-    if distance < 0.16 {
-        PUPIL
-    } else if distance < 0.36 {
-        IRIS
-    } else {
-        WHITE
+    let near = |ex: f32, ey: f32| (dx - ex).powi(2) + (dy - ey).powi(2) <= HALF_WIDTH * HALF_WIDTH;
+    near(-RADIUS, 0.0) || near(0.0, -RADIUS)
+}
+
+/// Whether a point lies inside a polygon, by counting the edges a ray from it
+/// crosses.
+fn in_polygon(vertices: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut inside = false;
+    let mut previous = vertices[vertices.len() - 1];
+    for &(vx, vy) in vertices {
+        let (px, py) = previous;
+        if (vy > y) != (py > y) && x < vx + (y - vy) * (px - vx) / (py - vy) {
+            inside = !inside;
+        }
+        previous = (vx, vy);
     }
+    inside
 }
