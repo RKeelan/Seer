@@ -17,7 +17,7 @@
 //! user's desktop. When `SEER_CLIPBOARD_DIR` is set, it writes what it would
 //! have put there to [`SINK_PNG`] and [`SINK_DIB`] in that directory
 //! instead, which is how the tests see what was copied; otherwise copying
-//! fails.
+//! fails. Pasting reads the same directory: see [`super::paste`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,28 +51,33 @@ const OPEN_RETRY: Duration = Duration::from_millis(10);
 /// The size of a `BITMAPV5HEADER`.
 const DIBV5_HEADER: usize = 124;
 
-/// Where copies go.
+/// The clipboard a viewer copies to and pastes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Destination {
+pub enum Clipboard {
     /// The clipboard.
     System,
     /// Files in this directory, for a headless viewer under test.
     Sink(PathBuf),
-    /// Nowhere: a headless viewer with no `SEER_CLIPBOARD_DIR`.
+    /// None: a headless viewer with no `SEER_CLIPBOARD_DIR`.
     Unavailable,
 }
 
-impl Destination {
-    /// Where a viewer's copies go: the clipboard, or for a headless viewer
-    /// the directory `SEER_CLIPBOARD_DIR` names, if any.
+impl Clipboard {
+    /// A viewer's clipboard: the system's, or for a headless viewer the
+    /// directory `SEER_CLIPBOARD_DIR` names, if any.
     pub fn for_viewer(headless: bool) -> Self {
         if !headless {
-            return Destination::System;
+            return Clipboard::System;
         }
         match std::env::var_os("SEER_CLIPBOARD_DIR").filter(|value| !value.is_empty()) {
-            Some(directory) => Destination::Sink(directory.into()),
-            None => Destination::Unavailable,
+            Some(directory) => Clipboard::Sink(directory.into()),
+            None => Clipboard::Unavailable,
         }
+    }
+
+    /// The error for a headless viewer with no clipboard.
+    pub fn unavailable() -> Error {
+        Error::unexpected("a headless viewer has no clipboard unless SEER_CLIPBOARD_DIR is set")
     }
 }
 
@@ -101,28 +106,35 @@ struct Job {
     /// Premultiplied, as read back from the device.
     capture: Capture,
     rotation: Rotation,
-    destination: Destination,
+    clipboard: Clipboard,
 }
 
-/// Prepares copies on a thread of its own, one at a time in the order they
-/// are given, and calls its `notify` after each is ready. The thread starts
-/// with the first copy.
-pub struct Copier {
-    destination: Destination,
+/// Does work on a thread of its own, one job at a time in the order given,
+/// and calls its `notify` after each result is ready. The thread starts with
+/// the first job; if it cannot, the job is done on the caller's thread.
+/// Dropped, it lets the thread finish the jobs given to it.
+pub struct Background<J, R> {
+    name: &'static str,
+    work: Arc<dyn Fn(J) -> R + Send + Sync>,
     notify: Arc<dyn Fn() + Send + Sync>,
-    jobs: Option<Sender<Job>>,
-    ready: Receiver<Result<Ready>>,
-    send_ready: Sender<Result<Ready>>,
+    jobs: Option<Sender<J>>,
+    ready: Receiver<R>,
+    send_ready: Sender<R>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl Copier {
-    /// A copier sending copies to `destination`, calling `notify` after
-    /// each is ready.
-    pub fn new(destination: Destination, notify: impl Fn() + Send + Sync + 'static) -> Self {
+impl<J: Send + 'static, R: Send + 'static> Background<J, R> {
+    /// A thread named `name` that does `work` on each job, calling `notify`
+    /// after each.
+    pub fn new(
+        name: &'static str,
+        work: impl Fn(J) -> R + Send + Sync + 'static,
+        notify: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         let (send_ready, ready) = mpsc::channel();
-        Copier {
-            destination,
+        Background {
+            name,
+            work: Arc::new(work),
             notify: Arc::new(notify),
             jobs: None,
             ready,
@@ -131,19 +143,8 @@ impl Copier {
         }
     }
 
-    /// Sends later copies to `destination`.
-    pub fn set_destination(&mut self, destination: Destination) {
-        self.destination = destination;
-    }
-
-    /// Prepares a copy of `capture`, premultiplied pixels as read back from
-    /// the device, turned by `rotation`.
-    pub fn submit(&mut self, capture: Capture, rotation: Rotation) {
-        let job = Job {
-            capture,
-            rotation,
-            destination: self.destination.clone(),
-        };
+    /// Queues `job`.
+    pub fn submit(&mut self, job: J) {
         let job = match &self.jobs {
             Some(jobs) => match jobs.send(job) {
                 Ok(()) => return,
@@ -151,14 +152,15 @@ impl Copier {
             },
             None => job,
         };
-        let (send, jobs) = mpsc::channel::<Job>();
+        let (send, jobs) = mpsc::channel::<J>();
         let ready = self.send_ready.clone();
+        let work = Arc::clone(&self.work);
         let notify = Arc::clone(&self.notify);
         let thread = std::thread::Builder::new()
-            .name("copy".into())
+            .name(self.name.into())
             .spawn(move || {
                 for job in jobs {
-                    let _ = ready.send(prepare(job));
+                    let _ = ready.send(work(job));
                     notify();
                 }
             });
@@ -168,21 +170,20 @@ impl Copier {
                 self.jobs = Some(send);
                 self.thread = Some(thread);
             }
-            Err(error) => {
-                let _ = self.send_ready.send(Err(error.into()));
+            Err(_) => {
+                let _ = self.send_ready.send((self.work)(job));
                 (self.notify)();
             }
         }
     }
 
-    /// The next copy ready, or the reason it could not be made.
-    pub fn try_recv(&self) -> Option<Result<Ready>> {
+    /// The next result ready.
+    pub fn try_recv(&self) -> Option<R> {
         self.ready.try_recv().ok()
     }
 }
 
-impl Drop for Copier {
-    /// Lets the thread finish the copies given to it, then waits for it.
+impl<J, R> Drop for Background<J, R> {
     fn drop(&mut self) {
         self.jobs = None;
         if let Some(thread) = self.thread.take() {
@@ -191,21 +192,57 @@ impl Drop for Copier {
     }
 }
 
+/// Prepares copies on a thread of its own, one at a time in the order they
+/// are given, and calls its `notify` after each is ready.
+pub struct Copier {
+    clipboard: Clipboard,
+    thread: Background<Job, Result<Ready>>,
+}
+
+impl Copier {
+    /// A copier sending copies to `clipboard`, calling `notify` after each
+    /// is ready.
+    pub fn new(clipboard: Clipboard, notify: impl Fn() + Send + Sync + 'static) -> Self {
+        Copier {
+            clipboard,
+            thread: Background::new("copy", prepare, notify),
+        }
+    }
+
+    /// Sends later copies to `clipboard`.
+    pub fn set_clipboard(&mut self, clipboard: Clipboard) {
+        self.clipboard = clipboard;
+    }
+
+    /// Prepares a copy of `capture`, premultiplied pixels as read back from
+    /// the device, turned by `rotation`.
+    pub fn submit(&mut self, capture: Capture, rotation: Rotation) {
+        self.thread.submit(Job {
+            capture,
+            rotation,
+            clipboard: self.clipboard.clone(),
+        });
+    }
+
+    /// The next copy ready, or the reason it could not be made.
+    pub fn try_recv(&self) -> Option<Result<Ready>> {
+        self.thread.try_recv()
+    }
+}
+
 /// Turns, encodes and places a copy: in memory for the clipboard, or in a
 /// sink's files.
 fn prepare(job: Job) -> Result<Ready> {
-    if job.destination == Destination::Unavailable {
-        return Err(Error::unexpected(
-            "a headless viewer has no clipboard unless SEER_CLIPBOARD_DIR is set",
-        ));
+    if job.clipboard == Clipboard::Unavailable {
+        return Err(Clipboard::unavailable());
     }
     let mut capture = job.capture;
     unpremultiply(&mut capture.pixels);
     let capture = rotate(capture, job.rotation);
     let png = encode_png(&capture)?;
     let dib = dibv5(&capture);
-    let contents = match &job.destination {
-        Destination::Sink(directory) => {
+    let contents = match &job.clipboard {
+        Clipboard::Sink(directory) => {
             // The PNG goes last, so a reader that waits for it finds both.
             write_whole(directory, SINK_DIB, &dib)?;
             write_whole(directory, SINK_PNG, &png)?;
@@ -394,11 +431,28 @@ pub fn dibv5(capture: &Capture) -> Vec<u8> {
 
 /// Replaces the clipboard's contents with `png` and `dib`, owned by `hwnd`.
 fn put_on_clipboard(hwnd: HWND, png: Global, dib: Global) -> Result<()> {
+    let png_format = png_format()?;
+    with_clipboard(hwnd, || {
+        // SAFETY: this thread has the clipboard open.
+        unsafe { EmptyClipboard() }?;
+        png.give(png_format)?;
+        dib.give(u32::from(CF_DIBV5.0))
+    })
+}
+
+/// The registered clipboard format `PNG`.
+pub fn png_format() -> Result<u32> {
     // SAFETY: the format name is a static string.
-    let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
-    if png_format == 0 {
+    let format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+    if format == 0 {
         return Err(windows::core::Error::from_thread().into());
     }
+    Ok(format)
+}
+
+/// Opens the clipboard for `hwnd`, a window of this thread, waiting a little
+/// if another program has it, runs `act`, and closes it again.
+pub fn with_clipboard<T>(hwnd: HWND, act: impl FnOnce() -> Result<T>) -> Result<T> {
     let mut tries = 0;
     // SAFETY: the window is this thread's, and the clipboard is closed below.
     while let Err(error) = unsafe { OpenClipboard(Some(hwnd)) } {
@@ -411,17 +465,12 @@ fn put_on_clipboard(hwnd: HWND, png: Global, dib: Global) -> Result<()> {
         }
         std::thread::sleep(OPEN_RETRY);
     }
-    let put = || -> Result<()> {
-        // SAFETY: this thread has the clipboard open.
-        unsafe { EmptyClipboard() }?;
-        png.give(png_format)?;
-        dib.give(u32::from(CF_DIBV5.0))
-    };
-    let result = put();
+    let result = act();
     // SAFETY: this thread opened the clipboard above.
     let closed = unsafe { CloseClipboard() };
-    result?;
-    Ok(closed?)
+    let value = result?;
+    closed?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -541,7 +590,7 @@ mod tests {
         let notified = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut copier = {
             let notified = Arc::clone(&notified);
-            Copier::new(Destination::Sink(dir.path().to_owned()), move || {
+            Copier::new(Clipboard::Sink(dir.path().to_owned()), move || {
                 notified.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         };
@@ -574,17 +623,17 @@ mod tests {
 
         // Copies for the clipboard are left in memory for the UI thread;
         // dropped unused, the memory is freed.
-        copier.set_destination(Destination::System);
+        copier.set_clipboard(Clipboard::System);
         copier.submit(capture.clone(), Rotation::Half);
         let ready = next(&copier).unwrap();
         assert!(ready.contents.is_some());
         drop(ready);
 
-        copier.set_destination(Destination::Unavailable);
+        copier.set_clipboard(Clipboard::Unavailable);
         copier.submit(capture.clone(), Rotation::None);
         let error = next(&copier).err().unwrap();
         assert!(error.message.contains("SEER_CLIPBOARD_DIR"));
-        copier.set_destination(Destination::Sink(dir.join("no-such-dir")));
+        copier.set_clipboard(Clipboard::Sink(dir.join("no-such-dir")));
         copier.submit(capture, Rotation::None);
         assert!(next(&copier).is_err());
         drop(copier);
@@ -593,7 +642,7 @@ mod tests {
 
     #[test]
     fn destinations_follow_the_headless_flag() {
-        assert_eq!(Destination::for_viewer(false), Destination::System);
-        assert_ne!(Destination::for_viewer(true), Destination::System);
+        assert_eq!(Clipboard::for_viewer(false), Clipboard::System);
+        assert_ne!(Clipboard::for_viewer(true), Clipboard::System);
     }
 }

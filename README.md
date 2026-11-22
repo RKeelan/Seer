@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/RKeelan/Seer/actions/workflows/ci.yml/badge.svg)](https://github.com/RKeelan/Seer/actions/workflows/ci.yml)
 
-Seer is a fast image viewer for Windows that shows the images it was asked to open and nothing else, in one window, and that agents can drive and read back from.
+Seer is a fast image viewer for Windows that shows the images it was asked to open, or had pasted into it, and nothing else, in one window, and that agents can drive and read back from.
 
 ![An image in Seer, with a mark and its note, and the strip of open images below](docs/viewer.png)
 
@@ -31,7 +31,7 @@ Double-click an image in Explorer, or select several and press Enter, once Seer 
 - While an image is shown, the images either side of it are decoded in the background, so moving to one shows it at once. Decoded images are kept in memory up to a quarter of the machine's memory, at most 2 GB; beyond that, those shown longest ago are dropped and decoded again when needed. Images further away are not decoded until they are near the one shown.
 - With more than one image open, a strip of thumbnails along the bottom of the window shows them all in order, the shown one outlined, and each group bracketed under its name. The strip scrolls to keep the shown image in view; the wheel over it scrolls it, and clicking a thumbnail shows that image. Thumbnails are decoded on a thread of their own at background priority, so they never hold up the shown image, and only those the strip shows are decoded. They are small, so they are kept for as long as their image is open.
 - `seerw` with no files starts the viewer empty. It shows its window once it has been sent an image and drawn it, or after a second with nothing to show.
-- `seerw --headless` runs the viewer without ever showing its window or taking the focus, for tests. It answers the command line like any viewer, and also accepts `seer debug input`. It never touches the clipboard: what Ctrl+C copies goes to `clipboard.png` and `clipboard.dib` in the directory the `SEER_CLIPBOARD_DIR` environment variable names, and without it copying fails.
+- `seerw --headless` runs the viewer without ever showing its window or taking the focus, for tests. It answers the command line like any viewer, and also accepts `seer debug input`. It never touches the clipboard: what Ctrl+C copies goes to `clipboard.png` and `clipboard.dib` in the directory the `SEER_CLIPBOARD_DIR` environment variable names, and pasting reads that directory instead of the clipboard: the files listed one per line in `clipboard.files`, else `clipboard.png`, else the bitmap in `clipboard.dib`. Pasted folders are made in `pasted` inside it. Without the variable, copying and pasting fail.
 - `--no-activate` shows the window without taking the focus.
 
 The window follows Windows' light or dark setting for apps, title bar and note field included, and switches when the setting changes. A headless viewer is always dark.
@@ -51,6 +51,7 @@ When an open image's file is written, Seer reloads it once the writing stops, ke
 There is only ever one viewer window. The first `seerw.exe` to start owns it; any later one hands its files to the first, brings its window to the front, and exits. Many started at once all end up in the one window, in the order they reach it. `seer.exe` talks to the viewer over a named pipe that only the current user can open and that refuses connections from other machines.
 
 - `seer open [--group G] [--caption C]… [--compare] [--activate] <files…>` adds images to the window, starting the viewer if none is running, and reports the id given to each. A folder opens the images in it, as above, each reported on its own. The nth `--caption` belongs to the nth file. Without `--activate` the window does not take the focus: a running viewer flashes its taskbar button, and a new one shows behind the active window.
+- `seer paste [--group G] [--caption C] [--activate]` opens a copy of what is on the clipboard, as Ctrl+V does (see [Keys and mouse](#keys-and-mouse)), starting the viewer if none is running, and reports it as `open` does. Files copied together each get the caption, and those that could not be copied are reported as failed. With nothing to paste on the clipboard it fails with `no_images`. An agent can ask the user to take a screenshot and then open it this way.
 - `seer list` reports the open images (id, path, caption, group, size, load state and whether the file is missing), which one is selected, the zoom, the visible region and whether compare view is on. An image not decoded yet, or dropped from memory, is `loading` until it is near the one shown.
 - `seer close <id or path>…` removes images, and `seer close --all` removes them all. A bare number is an id; write `.\3` for a file named `3`. Naming an image that is not open is not an error: it is reported on stderr and in the JSON's `not_found`.
 - `seer clear <group>` removes a group's images.
@@ -86,8 +87,8 @@ Exit codes:
 - 0: success.
 - 1: unexpected failure.
 - 2: usage error.
-- 3: no viewer is running (every command except `open`, `install` and `uninstall`).
-- 4: one or more files could not be opened; the others were.
+- 3: no viewer is running (every command except `open`, `paste`, `install` and `uninstall`).
+- 4: one or more files could not be opened; the others were. Also `paste` with no image on the clipboard.
 - 5: `marks --wait` timed out.
 
 Two hidden commands exist for testing:
@@ -103,6 +104,8 @@ Two hidden commands exist for testing:
 - `R` turns the view a quarter turn clockwise and Shift+`R` anticlockwise. The file is never changed.
 - Delete or Ctrl+W closes the shown image.
 - Ctrl+C copies the shown image to the clipboard at full resolution, turned as the view is turned, or with a mark selected, only the part the mark covers. It goes on the clipboard both as PNG and as a bitmap with alpha (`CF_DIBV5`), so programs that read transparency keep it. In compare view the selected image is copied; an animation's copy is the frame shown, and an SVG file's is drawn at its size in pixels. An image still being decoded in full is copied once it is. The readout at the bottom of the image says what was copied, or that it could not be.
+- Ctrl+V opens a copy of what is on the clipboard and shows it. The copy is a file in `%LOCALAPPDATA%\Seer\pasted\<instance>`, so `seer list` and `seer marks` report its path like any other, and nothing done to it reaches the original. Files copied in Explorer are copied there under their own names (`shot.png`, then `shot-2.png` if that is taken), the images directly in a copied folder included, and files Seer does not read are left out. An image, such as a screenshot taken with Win+Shift+S, the Snipping Tool or Print Screen, is saved there as a PNG named for the time of the paste (`pasted-2026-11-21-153012.png`); it is read from the clipboard's PNG if it has one, which keeps transparency, and otherwise from its bitmap. When the clipboard holds both files and an image, the files are pasted. With nothing to paste, the readout says so.
+- Pasted images are temporary: closing one deletes its file, and closing the viewer deletes its pasted folder. A viewer that did not exit cleanly leaves its folder behind, and the next viewer to start deletes it, along with any other instance's folder that no running viewer owns.
 - Dragging with the right button draws a mark. `M` toggles mark mode, in which a left drag draws too; `M` or Escape leaves it. Releasing opens a note field beside the box: Enter keeps the mark and Escape discards it. Click a mark or the note drawn above it to select it, Delete to remove it, and double-click either or press F2 to edit its note. A selected mark is drawn in blue rather than red. In a headless viewer, `seer debug input` types a note with a `note_text` event, and screenshots show the field.
 - Ctrl+Enter finishes marking, answering any agent waiting on `seer marks --wait`. While one waits, the title bar and a banner across the window say so, and the banner's Done button does the same as Ctrl+Enter.
 - When the shown image belongs to a group, `C` toggles compare view, which shows the group side by side with one shared zoom, pan and rotation, in a grid from four images up, each with its caption (or file name) beneath. The selected image's tile is outlined, and clicking a tile selects it. `S` switches between that and a split view, which draws the image and the next in its group over the same area, divided by a line you can drag, with each one's caption in its top corner. `open --compare` opens the group straight into compare view. In single view the caption shows in the title bar.

@@ -16,7 +16,7 @@
 //! {"type":"note_text","text":"this row has the wrong title bar"}
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -215,6 +215,39 @@ pub enum Input {
         /// Why.
         error: Error,
     },
+    /// The window carried out [`Effect::Paste`]: these files, absolute,
+    /// hold what was on the clipboard.
+    #[serde(skip)]
+    Pasted {
+        /// The paste.
+        paste: Paste,
+        /// The files to open.
+        files: Vec<PathBuf>,
+        /// The files on the clipboard that could not be copied, and why.
+        failed: Vec<OpenFailure>,
+    },
+    /// The window could not carry out [`Effect::Paste`].
+    #[serde(skip)]
+    PasteFailed {
+        /// The paste.
+        paste: Paste,
+        /// Why; [`ErrorCode::NoImages`] when the clipboard holds no image.
+        error: Error,
+    },
+}
+
+/// A paste asked for with Ctrl+V or `seer paste`, which [`Effect::Paste`]
+/// carries to the window and [`Input::Pasted`] brings back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Paste {
+    /// The request to answer, for `seer paste`.
+    pub reply: Option<RequestId>,
+    /// The group the images join.
+    pub group: Option<String>,
+    /// The caption each image gets.
+    pub caption: Option<String>,
+    /// Whether to bring the window to the foreground.
+    pub activate: bool,
 }
 
 /// What the window must do on the state machine's behalf.
@@ -332,6 +365,19 @@ pub enum Effect {
         region: PixelRect,
         /// The view's rotation, applied to the copy.
         rotation: Rotation,
+    },
+    /// Read the clipboard and save a copy of the files or the image on it in
+    /// the pasted folder. Report the copies as [`Input::Pasted`], or the
+    /// failure as [`Input::PasteFailed`].
+    Paste {
+        /// The paste.
+        paste: Paste,
+    },
+    /// Delete a pasted file whose image has been closed. The file is the
+    /// viewer's own copy of what was pasted.
+    Discard {
+        /// The file.
+        path: PathBuf,
     },
     /// Close the window and end the process.
     Quit,
@@ -580,6 +626,10 @@ const READOUT_HOLD: Duration = Duration::from_millis(1000);
 const READOUT_FADE_OUT: Duration = Duration::from_millis(300);
 /// What the readout says when a copy could not be made.
 pub const COPY_FAILED: &str = "Could not copy";
+/// What the readout says when Ctrl+V finds no image on the clipboard.
+pub const NOTHING_TO_PASTE: &str = "No image to paste";
+/// What the readout says when a paste could not be made.
+pub const PASTE_FAILED: &str = "Could not paste";
 /// The interval between frames of an animation.
 const FRAME: Duration = Duration::from_millis(16);
 /// How far, in pixels at 100% scale, the pointer must move with a button
@@ -650,6 +700,8 @@ pub struct App {
     /// A copy asked for and not yet sent, waiting for its image's full
     /// decode.
     copy: Option<CopyAsk>,
+    /// The images opened from pasted files, which are deleted once closed.
+    pasted: HashSet<ImageId>,
     strip: Strip,
     shown: Shown,
     cache: Cache,
@@ -820,6 +872,7 @@ impl App {
             zoom_changed: None,
             notice: None,
             copy: None,
+            pasted: HashSet::new(),
             strip: Strip::default(),
             shown: Shown {
                 title: None,
@@ -943,6 +996,65 @@ impl App {
                 self.notify(format!("Copied {} × {}", size.width, size.height));
             }
             Input::CopyFailed { .. } => self.notify(COPY_FAILED.to_string()),
+            Input::Pasted {
+                paste,
+                files,
+                failed,
+            } => self.pasted(paste, files, failed, effects),
+            Input::PasteFailed { paste, error } => {
+                self.notify(
+                    if error.code == ErrorCode::NoImages {
+                        NOTHING_TO_PASTE
+                    } else {
+                        PASTE_FAILED
+                    }
+                    .to_string(),
+                );
+                if let Some(id) = paste.reply {
+                    effects.push(Effect::Reply {
+                        id,
+                        response: Response::Error(error),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Opens the files a paste produced, as `seer open` would, and answers
+    /// `seer paste` with what was opened.
+    fn pasted(
+        &mut self,
+        paste: Paste,
+        files: Vec<PathBuf>,
+        failed: Vec<OpenFailure>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let files = files
+            .into_iter()
+            .map(|path| OpenFile {
+                path,
+                caption: paste.caption.clone(),
+            })
+            .collect();
+        let mut reply = self.open(files, paste.group, false, paste.activate, None, effects);
+        if let Reply::Opened(opened) = &mut reply {
+            self.pasted.extend(
+                opened
+                    .images
+                    .iter()
+                    .filter(|image| !image.existing)
+                    .map(|image| image.id),
+            );
+            opened.failed.splice(0..0, failed);
+            if opened.images.is_empty() {
+                self.notify(PASTE_FAILED.to_string());
+            }
+        }
+        if let Some(id) = paste.reply {
+            effects.push(Effect::Reply {
+                id,
+                response: Response::Ok(reply),
+            });
         }
     }
 
@@ -990,6 +1102,14 @@ impl App {
                 Key::Enter => self.finish_marking(effects),
                 Key::Char('w') => self.close_selected(effects),
                 Key::Char('c') => self.ask_copy(),
+                Key::Char('v') => effects.push(Effect::Paste {
+                    paste: Paste {
+                        reply: None,
+                        group: None,
+                        caption: None,
+                        activate: true,
+                    },
+                }),
                 Key::Plus | Key::Minus | Key::Char('0') | Key::Char('1') => self.zoom_key(key),
                 _ => {}
             }
@@ -1496,6 +1616,21 @@ impl App {
                 activate,
                 select,
             } => Ok(self.open(files, group, compare, activate, select, effects)),
+            Request::Paste {
+                group,
+                caption,
+                activate,
+            } => {
+                effects.push(Effect::Paste {
+                    paste: Paste {
+                        reply: Some(id),
+                        group,
+                        caption,
+                        activate,
+                    },
+                });
+                return;
+            }
             Request::List => Ok(Reply::List(self.list())),
             Request::Close { images } => {
                 let mut ids = Vec::new();
@@ -1776,13 +1911,16 @@ impl App {
     }
 
     fn remove(&mut self, id: ImageId, effects: &mut Vec<Effect>) {
-        if self.set.remove(id).is_some() {
+        if let Some(entry) = self.set.remove(id) {
             self.images.remove(&id);
             self.marks.remove_image(id);
             self.cache.forget(id);
             effects.push(Effect::CancelDecode { image: id });
             effects.push(Effect::Evict { image: id });
             effects.push(Effect::Unwatch { image: id });
+            if self.pasted.remove(&id) {
+                effects.push(Effect::Discard { path: entry.path });
+            }
         }
     }
 
@@ -2388,19 +2526,29 @@ impl App {
             });
         }
 
-        if let (Some(opacity), Some(pane)) = (self.readout_opacity(), self.selected_pane())
-            && let Some(frame) = self.frame(&pane)
-        {
+        // With no image shown, as when a paste finds nothing, a notice shows
+        // at the bottom of the window.
+        let readout = self.readout_opacity().and_then(|opacity| {
+            let Some(pane) = self.selected_pane() else {
+                let (notice, _) = self.notice.as_ref()?;
+                return Some((opacity, area, notice.clone()));
+            };
             let words = match &self.notice {
                 Some((notice, _)) => notice.clone(),
-                None => format!("{:.0}%", self.view(pane.image).zoom(frame) * 100.0),
+                None => {
+                    let frame = self.frame(&pane)?;
+                    format!("{:.0}%", self.view(pane.image).zoom(frame) * 100.0)
+                }
             };
+            Some((opacity, pane.viewport, words))
+        });
+        if let Some((opacity, viewport, words)) = readout {
             // Wide enough for the zoom, or roughly for a notice's characters.
             let characters = words.chars().count() as f64;
             let (width, height) = ((characters * 8.0 + 32.0).max(80.0) * scale, 28.0 * scale);
             let rect = Rect::new(
-                pane.viewport.x + (pane.viewport.width - width) / 2.0,
-                pane.viewport.bottom() - height - 16.0 * scale,
+                viewport.x + (viewport.width - width) / 2.0,
+                viewport.bottom() - height - 16.0 * scale,
                 width,
                 height,
             );
@@ -4991,5 +5139,191 @@ mod session_tests {
         session.drag(Button::Right, (100.0, 100.0), (300.0, 200.0));
         assert!(copy(&mut session).is_empty());
         assert!(session.app.copy.is_none());
+    }
+
+    /// The pastes asked for.
+    fn pastes(effects: &[Effect]) -> Vec<Paste> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Paste { paste } => Some(paste.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The notice the readout shows, if any.
+    fn notice(session: &Session) -> Option<String> {
+        let notice = session.app.notice.as_ref()?.0.clone();
+        let shown = session.app.scene().items.iter().any(|item| match item {
+            Item::Text { text, .. } => *text == notice,
+            _ => false,
+        });
+        shown.then_some(notice)
+    }
+
+    #[test]
+    fn ctrl_v_opens_what_the_window_pasted() {
+        let mut session = Session::new();
+        session.open(&[r"C:\shots\one.png"]);
+        let asked = pastes(&session.key_with(Key::Char('v'), Modifiers::CTRL));
+        let paste = Paste {
+            reply: None,
+            group: None,
+            caption: None,
+            activate: true,
+        };
+        assert_eq!(asked, std::slice::from_ref(&paste));
+        // A plain V pastes nothing.
+        assert!(pastes(&session.key(Key::Char('v'))).is_empty());
+
+        let effects = session.send(Input::Pasted {
+            paste: paste.clone(),
+            files: vec![PathBuf::from(r"C:\pasted\pasted-1.png")],
+            failed: Vec::new(),
+        });
+        assert!(effects.contains(&Effect::Activate));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Reply { .. })));
+        let list = session.list();
+        assert_eq!(list.images.len(), 2);
+        assert_eq!(
+            list.images[1].path,
+            PathBuf::from(r"C:\pasted\pasted-1.png")
+        );
+        assert_eq!(list.selected, Some(ImageId(2)));
+        assert_eq!(notice(&session), None);
+
+        // Files copied in Explorer open as they are; one that is gone says
+        // the paste failed.
+        session.send(Input::Pasted {
+            paste: paste.clone(),
+            files: vec![PathBuf::from(r"C:\shots\missing.png")],
+            failed: Vec::new(),
+        });
+        assert_eq!(notice(&session).as_deref(), Some(PASTE_FAILED));
+        assert_eq!(session.list().images.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_paste_says_why_even_with_nothing_open() {
+        let mut session = Session::new();
+        let paste = pastes(&session.key_with(Key::Char('v'), Modifiers::CTRL))
+            .pop()
+            .unwrap();
+        let effects = session.send(Input::PasteFailed {
+            paste: paste.clone(),
+            error: Error::new(ErrorCode::NoImages, "the clipboard holds no image"),
+        });
+        assert!(effects.contains(&Effect::Redraw));
+        assert_eq!(notice(&session).as_deref(), Some(NOTHING_TO_PASTE));
+        session.wait(1300);
+        session.send(Input::Tick);
+        assert_eq!(notice(&session), None);
+
+        session.send(Input::PasteFailed {
+            paste,
+            error: Error::unexpected("the clipboard is busy"),
+        });
+        assert_eq!(notice(&session).as_deref(), Some(PASTE_FAILED));
+    }
+
+    #[test]
+    fn seer_paste_is_answered_once_the_window_has_pasted() {
+        let mut session = Session::new();
+        let (id, effects) = session.request(Request::Paste {
+            group: Some("bugs".into()),
+            caption: Some("menu".into()),
+            activate: false,
+        });
+        assert!(reply(&effects, id).is_none());
+        let paste = Paste {
+            reply: Some(id),
+            group: Some("bugs".into()),
+            caption: Some("menu".into()),
+            activate: false,
+        };
+        assert_eq!(pastes(&effects), std::slice::from_ref(&paste));
+
+        // Files that could not be copied are reported with the opened ones.
+        let uncopied = OpenFailure {
+            path: PathBuf::from(r"C:\notes.txt"),
+            error: Error::new(ErrorCode::UnsupportedFormat, "not an image"),
+        };
+        let effects = session.send(Input::Pasted {
+            paste: paste.clone(),
+            files: vec![PathBuf::from(r"C:\pasted\pasted-1.png")],
+            failed: vec![uncopied.clone()],
+        });
+        assert!(effects.contains(&Effect::FlashTaskbar));
+        match reply(&effects, id) {
+            Some(Ok(Reply::Opened(opened))) => {
+                assert_eq!(opened.images.len(), 1);
+                assert_eq!(opened.images[0].id, ImageId(1));
+                assert_eq!(opened.failed, [uncopied]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let list = session.list();
+        assert_eq!(list.images[0].group.as_deref(), Some("bugs"));
+        assert_eq!(list.images[0].caption.as_deref(), Some("menu"));
+
+        let error = Error::new(ErrorCode::NoImages, "the clipboard holds no image");
+        let effects = session.send(Input::PasteFailed {
+            paste,
+            error: error.clone(),
+        });
+        assert_eq!(reply(&effects, id), Some(Err(error)));
+    }
+
+    /// The files closing asked to have deleted.
+    fn discards(effects: &[Effect]) -> Vec<PathBuf> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Discard { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn closing_a_pasted_image_deletes_its_file() {
+        let mut session = Session::new();
+        session.open(&[r"C:\shots\one.png"]);
+        let pasted: Vec<PathBuf> = (1..=4)
+            .map(|n| PathBuf::from(format!(r"C:\pasted\{n}.png")))
+            .collect();
+        session.send(Input::Pasted {
+            paste: Paste {
+                reply: None,
+                group: Some("g".into()),
+                caption: None,
+                activate: true,
+            },
+            files: pasted.clone(),
+            failed: Vec::new(),
+        });
+        assert_eq!(session.list().images.len(), 5);
+
+        // Opening a pasted file again selects it, and it is still deleted
+        // once closed.
+        session.open(&[r"C:\pasted\1.png"]);
+        assert_eq!(discards(&session.key(Key::Delete)), [pasted[0].clone()]);
+        session.open(&[r"C:\pasted\2.png"]);
+        let closed = discards(&session.key_with(Key::Char('w'), Modifiers::CTRL));
+        assert_eq!(closed, [pasted[1].clone()]);
+        let (_, effects) = session.request(Request::Close {
+            images: vec![ImageRef::Path(pasted[2].clone()), ImageRef::Id(ImageId(1))],
+        });
+        assert_eq!(discards(&effects), [pasted[2].clone()]);
+        let (_, effects) = session.request(Request::Clear { group: "g".into() });
+        assert_eq!(discards(&effects), [pasted[3].clone()]);
+
+        session.open(&[r"C:\shots\one.png"]);
+        let (_, effects) = session.request(Request::CloseAll);
+        assert!(
+            discards(&effects).is_empty(),
+            "opened files are never deleted"
+        );
     }
 }
