@@ -225,7 +225,17 @@ impl Source {
         let failed = |error: windows::core::Error| decode_error(&self.path, &error);
         match &self.kind {
             Kind::Still(still) => {
-                let want = still.orientation.apply_size(target_size(size, target));
+                let mut want = still.orientation.apply_size(target_size(size, target));
+                // Scaling to fit without the codec's help decodes every pixel
+                // and then scales, which costs more than the full decode the
+                // viewer asks for next. Decoding in full makes that one
+                // unnecessary.
+                if matches!(target, DecodeTarget::Fit { .. })
+                    && want != still.stored
+                    && still.native_size(want).map_err(failed)?.is_none()
+                {
+                    want = still.stored;
+                }
                 let pixels = still.pixels(want).map_err(failed)?;
                 let (bitmap_size, pixels) = still.orientation.apply(want, pixels);
                 Ok(Decoded {
@@ -331,13 +341,10 @@ impl Still {
         Ok(pixels)
     }
 
-    /// The frame scaled by the codec itself to the smallest size it can
-    /// produce that is no smaller than `want`, if the codec can scale and that
-    /// size is smaller than the stored one.
-    fn native_scale(
-        &self,
-        want: PixelSize,
-    ) -> windows::core::Result<Option<(IWICBitmapSource, PixelSize)>> {
+    /// The smallest size the codec itself can scale the frame to that is no
+    /// smaller than `want`, if the codec can scale and that size is smaller
+    /// than the stored one.
+    fn native_size(&self, want: PixelSize) -> windows::core::Result<Option<PixelSize>> {
         let Ok(transform) = self.frame.cast::<IWICBitmapSourceTransform>() else {
             return Ok(None);
         };
@@ -357,9 +364,19 @@ impl Still {
                 (ask.height * 2).min(self.stored.height),
             );
         };
-        if size.width >= self.stored.width && size.height >= self.stored.height {
+        let smaller = size.width < self.stored.width || size.height < self.stored.height;
+        Ok(smaller.then_some(size))
+    }
+
+    /// The frame scaled by the codec itself to [`Still::native_size`].
+    fn native_scale(
+        &self,
+        want: PixelSize,
+    ) -> windows::core::Result<Option<(IWICBitmapSource, PixelSize)>> {
+        let Some(size) = self.native_size(want)? else {
             return Ok(None);
-        }
+        };
+        let transform: IWICBitmapSourceTransform = self.frame.cast()?;
         let mut format = GUID_WICPixelFormat32bppPBGRA;
         // SAFETY: the pointer is to a live local, which the codec changes to
         // the nearest format it can produce.
@@ -1102,6 +1119,38 @@ mod tests {
             },
         ];
         write_animated_gif(path, 4, 2, &frames, loop_count).unwrap();
+    }
+
+    #[test]
+    fn a_fit_the_codec_cannot_scale_to_is_decoded_in_full() {
+        let dir = TempDir::new().unwrap();
+        let fit = |width, height| DecodeTarget::Fit {
+            within: PixelSize::new(width, height),
+        };
+        let jpeg = dir.join("image.jpg");
+        write_image(&jpeg, &Pixels::solid(800, 600, Rgba::GREEN), Format::Jpeg).unwrap();
+        let source = Decoder::new().unwrap().open(&jpeg).unwrap();
+        // Halved by the codec, then scaled the rest of the way.
+        let halved = source.decode(fit(300, 300)).unwrap();
+        assert_eq!(halved.bitmap_size, PixelSize::new(300, 225));
+        // Halving would be too small, so the whole image is decoded.
+        let whole = source.decode(fit(600, 600)).unwrap();
+        assert_eq!(whole.bitmap_size, PixelSize::new(800, 600));
+
+        // PNG has no scaling of its own.
+        let png = dir.join("image.png");
+        write_image(&png, &Pixels::solid(80, 60, Rgba::BLUE), Format::Png).unwrap();
+        let whole = decode(&png, fit(40, 40)).unwrap();
+        assert_eq!(whole.bitmap_size, PixelSize::new(80, 60));
+        // Other targets still scale.
+        let thumbnail = decode(
+            &png,
+            DecodeTarget::Thumbnail {
+                at_most: PixelSize::new(40, 40),
+            },
+        )
+        .unwrap();
+        assert_eq!(thumbnail.bitmap_size, PixelSize::new(40, 30));
     }
 
     #[test]
