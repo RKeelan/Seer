@@ -174,7 +174,8 @@ fn start(args: &RunArgs) -> Result<u8> {
         .iter()
         .map(|path| std::path::absolute(path).map_err(Error::from))
         .collect::<Result<Vec<_>>>()?;
-    let _mutex = match take_instance(&instance, &files)? {
+    let select = selection.as_ref().map(|selection| selection.select);
+    let _mutex = match take_instance(&instance, &files, select)? {
         Ownership::Owner(mutex) => mutex,
         Ownership::HandedOff(code) => return Ok(code),
     };
@@ -209,7 +210,7 @@ fn start(args: &RunArgs) -> Result<u8> {
     // included, waits for the window.
     let mut early = Vec::new();
     if !files.is_empty() {
-        let request = open_request(&files, !args.no_activate);
+        let request = open_request(&files, !args.no_activate, select);
         let input = Input::Request {
             id: COMMAND_LINE,
             request,
@@ -346,7 +347,11 @@ fn delegated(args: &RunArgs) -> Result<execute::Selection> {
 /// A viewer that holds the mutex may not serve its pipe yet, and one that is
 /// exiting may let go of the mutex without answering, so this tries both
 /// again until one succeeds or [`client::LAUNCH_TIMEOUT`] passes.
-fn take_instance(instance: &InstanceName, files: &[PathBuf]) -> Result<Ownership> {
+fn take_instance(
+    instance: &InstanceName,
+    files: &[PathBuf],
+    select: Option<usize>,
+) -> Result<Ownership> {
     let deadline = Instant::now() + client::LAUNCH_TIMEOUT;
     loop {
         if let Some(mutex) = InstanceMutex::acquire(instance)? {
@@ -355,7 +360,7 @@ fn take_instance(instance: &InstanceName, files: &[PathBuf]) -> Result<Ownership
         if files.is_empty() {
             return Ok(Ownership::HandedOff(0));
         }
-        match hand_off(instance, files) {
+        match hand_off(instance, files, select) {
             Err(error) if error.code == ErrorCode::NoViewer && Instant::now() < deadline => {}
             result => return result.map(Ownership::HandedOff),
         }
@@ -364,8 +369,8 @@ fn take_instance(instance: &InstanceName, files: &[PathBuf]) -> Result<Ownership
 
 /// Sends the files to the running viewer, letting it come to the foreground,
 /// and returns the exit code: 4 if any could not be opened.
-fn hand_off(instance: &InstanceName, files: &[PathBuf]) -> Result<u8> {
-    let reply = client::connect(instance)?.send(&open_request(files, true))?;
+fn hand_off(instance: &InstanceName, files: &[PathBuf], select: Option<usize>) -> Result<u8> {
+    let reply = client::connect(instance)?.send(&open_request(files, true, select))?;
     Ok(match reply {
         Reply::Opened(opened) => opened
             .failed
@@ -375,7 +380,7 @@ fn hand_off(instance: &InstanceName, files: &[PathBuf]) -> Result<u8> {
     })
 }
 
-fn open_request(files: &[PathBuf], activate: bool) -> Request {
+fn open_request(files: &[PathBuf], activate: bool, select: Option<usize>) -> Request {
     Request::Open {
         files: files
             .iter()
@@ -387,6 +392,7 @@ fn open_request(files: &[PathBuf], activate: bool) -> Request {
         group: None,
         compare: false,
         activate,
+        select,
     }
 }
 
@@ -1525,7 +1531,7 @@ mod tests {
         );
         viewer.handle(Input::Request {
             id: COMMAND_LINE,
-            request: open_request(&[path.clone(), dir.join("absent.png")], false),
+            request: open_request(&[path.clone(), dir.join("absent.png")], false, None),
         });
         assert_eq!(
             viewer.first_error.as_ref().unwrap().code,
@@ -1594,7 +1600,7 @@ mod tests {
         );
         viewer.handle(Input::Request {
             id: COMMAND_LINE,
-            request: open_request(&[gif, svg], false),
+            request: open_request(&[gif, svg], false, None),
         });
         // The shown image decodes first; its neighbour is held back until
         // decoding ahead starts.
@@ -1646,7 +1652,7 @@ mod tests {
         );
         viewer.handle(Input::Request {
             id: COMMAND_LINE,
-            request: open_request(&[path], true),
+            request: open_request(&[path], true, None),
         });
         let output = next_output(&viewer.worker);
         viewer.accept(output);
@@ -1710,7 +1716,7 @@ mod tests {
         );
         viewer.handle(Input::Request {
             id: COMMAND_LINE,
-            request: open_request(std::slice::from_ref(&path), false),
+            request: open_request(std::slice::from_ref(&path), false, None),
         });
         let image = viewer.app.set().selected().unwrap();
         let output = next_output(&viewer.worker);
@@ -1780,7 +1786,7 @@ mod tests {
         viewer.visibility = Visibility::Shown;
         viewer.handle(Input::Request {
             id: COMMAND_LINE,
-            request: open_request(&[path], false),
+            request: open_request(&[path], false, None),
         });
         let output = next_output(&viewer.worker);
         viewer.accept(output);
@@ -1857,7 +1863,7 @@ mod tests {
         );
         viewer.handle(Input::Request {
             id: COMMAND_LINE,
-            request: open_request(&[red.clone(), blue], false),
+            request: open_request(&[red.clone(), blue], false, None),
         });
         // The neighbour's decode waits for the first frame, as at start-up.
         viewer.start_prefetching();

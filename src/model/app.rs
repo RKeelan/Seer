@@ -1388,7 +1388,8 @@ impl App {
                 group,
                 compare,
                 activate,
-            } => Ok(self.open(files, group, compare, activate, effects)),
+                select,
+            } => Ok(self.open(files, group, compare, activate, select, effects)),
             Request::List => Ok(Reply::List(self.list())),
             Request::Close { images } => {
                 let mut ids = Vec::new();
@@ -1473,11 +1474,13 @@ impl App {
         group: Option<String>,
         compare: bool,
         activate: bool,
+        select: Option<usize>,
         effects: &mut Vec<Effect>,
     ) -> Reply {
         let mut images = Vec::new();
         let mut failed = Vec::new();
-        for file in files {
+        let mut chosen = None;
+        for (index, file) in files.into_iter().enumerate() {
             let canonical = match self.files.canonical(&file.path) {
                 Ok(canonical) => canonical,
                 Err(error) => {
@@ -1520,15 +1523,18 @@ impl App {
                     path: file.path.clone(),
                 });
             }
+            if select == Some(index) {
+                chosen = Some(id);
+            }
             images.push(OpenedImage {
                 id,
                 path: file.path,
                 existing,
             });
         }
-        if let Some(first) = images.first() {
+        if let Some(shown) = chosen.or(images.first().map(|image| image.id)) {
             self.navigate(|set| {
-                set.select(first.id);
+                set.select(shown);
             });
             if compare
                 && group.is_some()
@@ -2686,6 +2692,7 @@ mod session_tests {
                 group: group.map(str::to_string),
                 compare,
                 activate: false,
+                select: None,
             });
             match reply(&effects, id) {
                 Some(Ok(Reply::Opened(opened))) => (opened, effects),
@@ -3012,6 +3019,7 @@ mod session_tests {
             group: None,
             compare: false,
             activate: true,
+            select: None,
         });
         assert!(effects.contains(&Effect::Activate));
         assert!(reply(&effects, id).unwrap().is_ok());
@@ -3045,6 +3053,30 @@ mod session_tests {
         // Nothing opened: no focus change.
         let (_, effects) = session.open_with(&[r"C:\missing.png"], None, false);
         assert!(!effects.contains(&Effect::FlashTaskbar));
+    }
+
+    #[test]
+    fn opening_selects_the_file_asked_for() {
+        let mut session = Session::new();
+        let open = |paths: &[&str], select| Request::Open {
+            files: paths
+                .iter()
+                .map(|path| OpenFile {
+                    path: PathBuf::from(path),
+                    caption: None,
+                })
+                .collect(),
+            group: None,
+            compare: false,
+            activate: false,
+            select,
+        };
+        session.request(open(&[r"C:\01.png", r"C:\02.png", r"C:\03.png"], Some(1)));
+        assert_eq!(session.selected(), Some(2));
+
+        // A file asked for that cannot be opened selects the first opened.
+        session.request(open(&[r"C:\missing.png", r"C:\04.png"], Some(0)));
+        assert_eq!(session.selected(), Some(4));
     }
 
     #[test]
@@ -3434,6 +3466,7 @@ mod session_tests {
             group: None,
             compare: false,
             activate: false,
+            select: None,
         });
         let effects = session.decode(1, 640, 480);
         assert_eq!(
@@ -4190,6 +4223,7 @@ mod session_tests {
             group: Some("fix".into()),
             compare: true,
             activate: false,
+            select: None,
         });
         session.decode(1, 800, 600);
         session.decode(2, 800, 600);

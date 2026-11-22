@@ -6,8 +6,12 @@
 //! useful order. `seer install` also registers the verb's `DelegateExecute`
 //! as [`CLSID`], whose local server is `seerw.exe`. Explorer then starts one
 //! `seerw -Embedding` through COM, creates a command object in it, hands it
-//! the whole selection as a shell item array, in Explorer's order, and calls
-//! `Execute`.
+//! the whole selection as a shell item array, and calls `Execute`.
+//!
+//! Explorer's array starts at the focused file and wraps round to the start
+//! of the folder. The command also gets the folder view as its site, so it
+//! puts the files in the view's order, whatever the folder is sorted by, and
+//! selects the focused one. Without a view, the array's order is kept.
 //!
 //! [`serve`] registers the class and waits for that, on a thread of its own
 //! in the multithreaded apartment, so the viewer's own thread never joins an
@@ -15,6 +19,7 @@
 //! the selection's files had been its command line. A plain `seerw <file>`
 //! never comes here and never initialises COM for it.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -28,9 +33,11 @@ use windows::Win32::System::Com::{
     CoRevokeClassObject, CoTaskMemFree, CoUninitialize, IClassFactory, IClassFactory_Impl,
     REGCLS_SINGLEUSE,
 };
+use windows::Win32::System::Ole::{IObjectWithSite, IObjectWithSite_Impl};
 use windows::Win32::UI::Shell::{
-    IExecuteCommand, IExecuteCommand_Impl, IObjectWithSelection, IObjectWithSelection_Impl,
-    IShellItemArray, SIGDN_FILESYSPATH,
+    _SVGIO, IExecuteCommand, IExecuteCommand_Impl, IFolderView, IObjectWithSelection,
+    IObjectWithSelection_Impl, IShellItemArray, IUnknown_QueryService, SIGDN_FILESYSPATH,
+    SVGIO_FLAG_VIEWORDER, SVGIO_SELECTION,
 };
 use windows::core::{BOOL, GUID, IUnknown, Interface, PCWSTR, Ref, implement};
 
@@ -63,9 +70,11 @@ pub fn parse_clsid(text: &str) -> Result<GUID> {
 /// leave Explorer calling a server that is gone.
 #[derive(Debug)]
 pub struct Selection {
-    /// The selection's files, in Explorer's order. Items with no file system
-    /// path, such as This PC, are left out.
+    /// The selection's files, in the folder view's order. Items with no file
+    /// system path, such as This PC, are left out.
     pub files: Vec<PathBuf>,
+    /// The index in `files` of the focused file.
+    pub select: usize,
     server: Option<JoinHandle<()>>,
 }
 
@@ -92,11 +101,13 @@ pub fn serve(clsid: GUID, timeout: Duration) -> Result<Selection> {
     }
     let mut selection = Selection {
         files: Vec::new(),
+        select: 0,
         server: Some(server),
     };
     match files.recv_timeout(timeout) {
-        Ok(files) => {
+        Ok((files, select)) => {
             selection.files = files;
+            selection.select = select;
             Ok(selection)
         }
         Err(_) => Err(Error::unexpected(
@@ -108,7 +119,7 @@ pub fn serve(clsid: GUID, timeout: Duration) -> Result<Selection> {
 fn run_server(
     clsid: GUID,
     timeout: Duration,
-    files: Sender<Vec<PathBuf>>,
+    files: Sender<Chosen>,
     registered: Sender<Result<()>>,
 ) {
     // SAFETY: initialising COM on a new thread has no preconditions; it is
@@ -143,10 +154,13 @@ fn run_server(
     unsafe { CoUninitialize() };
 }
 
+/// The files to open and the index of the one to select.
+type Chosen = (Vec<PathBuf>, usize);
+
 /// The class object, which makes one [`Command`] for each request.
 #[implement(IClassFactory)]
 struct Factory {
-    files: Sender<Vec<PathBuf>>,
+    files: Sender<Chosen>,
     released: Sender<()>,
 }
 
@@ -167,6 +181,7 @@ impl IClassFactory_Impl for Factory_Impl {
         }
         let command: IUnknown = Command {
             selection: Mutex::new(None),
+            site: Mutex::new(None),
             files: self.files.clone(),
             released: self.released.clone(),
         }
@@ -182,10 +197,12 @@ impl IClassFactory_Impl for Factory_Impl {
 }
 
 /// The command object Explorer gives the selection to and executes.
-#[implement(IExecuteCommand, IObjectWithSelection)]
+#[implement(IExecuteCommand, IObjectWithSelection, IObjectWithSite)]
 struct Command {
     selection: Mutex<Option<IShellItemArray>>,
-    files: Sender<Vec<PathBuf>>,
+    /// The folder view's site, when Explorer gives one.
+    site: Mutex<Option<IUnknown>>,
+    files: Sender<Chosen>,
     released: Sender<()>,
 }
 
@@ -201,6 +218,36 @@ impl Command {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn site(&self) -> Option<IUnknown> {
+        self.site
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl IObjectWithSite_Impl for Command_Impl {
+    fn SetSite(&self, site: Ref<IUnknown>) -> windows::core::Result<()> {
+        *self
+            .site
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = site.cloned();
+        Ok(())
+    }
+
+    fn GetSite(&self, iid: *const GUID, object: *mut *mut c_void) -> windows::core::Result<()> {
+        if object.is_null() || iid.is_null() {
+            return Err(E_POINTER.into());
+        }
+        // SAFETY: `object` was checked above, and COM passes it writable.
+        unsafe { *object = std::ptr::null_mut() };
+        let site = self
+            .site()
+            .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+        // SAFETY: `iid` and `object` were checked above.
+        unsafe { site.query(iid, object) }.ok()
     }
 }
 
@@ -260,11 +307,43 @@ impl IExecuteCommand_Impl for Command_Impl {
         let items = self
             .selection()
             .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
-        let files = paths(&items)?;
+        let given = paths(&items)?;
+        let view = self.site().and_then(|site| view_order(&site));
+        let chosen = in_view_order(given, view.as_deref().unwrap_or_default());
         // The viewer may have given up waiting; there is nothing more to do.
-        let _ = self.files.send(files);
+        let _ = self.files.send(chosen);
         Ok(())
     }
+}
+
+/// The paths of the folder view's selected files, in the view's order, from
+/// the site Explorer gives the command.
+fn view_order(site: &IUnknown) -> Option<Vec<PathBuf>> {
+    // SAFETY: the site is a live object. A folder view's site serves the view
+    // under the view's own interface id.
+    let view: IFolderView = unsafe { IUnknown_QueryService(site, &IFolderView::IID) }.ok()?;
+    let flags = _SVGIO(SVGIO_SELECTION.0 | SVGIO_FLAG_VIEWORDER.0);
+    // SAFETY: Items returns the interface it is asked for.
+    let items: IShellItemArray = unsafe { view.Items(flags) }.ok()?;
+    paths(&items).ok()
+}
+
+/// Puts the files Explorer gave in the order `view` lists them, and finds
+/// the first of them, the focused file, in that order. Files `view` does not
+/// list keep their order, after those it does.
+pub fn in_view_order(given: Vec<PathBuf>, view: &[PathBuf]) -> Chosen {
+    let position: HashMap<&PathBuf, usize> = view
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path, index))
+        .collect();
+    let focused = given.first().cloned();
+    let mut files = given;
+    files.sort_by_key(|file| position.get(file).copied().unwrap_or(usize::MAX));
+    let select = focused
+        .and_then(|focused| files.iter().position(|file| *file == focused))
+        .unwrap_or(0);
+    (files, select)
 }
 
 /// The file system paths of the items, in order, leaving out items that have
@@ -303,7 +382,7 @@ mod tests {
 
     /// A command object as the factory makes it, with the ends of its
     /// channels.
-    fn command() -> (IExecuteCommand, Receiver<Vec<PathBuf>>, Receiver<()>) {
+    fn command() -> (IExecuteCommand, Receiver<Chosen>, Receiver<()>) {
         crate::testutil::init_com();
         let (files_sent, files) = mpsc::channel();
         let (released_sent, released) = mpsc::channel();
@@ -355,7 +434,9 @@ mod tests {
             command.SetDirectory(windows::core::w!(r"C:\")).unwrap();
             command.Execute().unwrap();
         }
-        assert_eq!(canonical(&sent.try_recv().unwrap()), canonical(&files));
+        let (sent_files, select) = sent.try_recv().unwrap();
+        assert_eq!(canonical(&sent_files), canonical(&files));
+        assert_eq!(select, 0);
         // SAFETY: the selection is asked for as the interface it is.
         let back: IShellItemArray = unsafe { with_selection.GetSelection() }.unwrap();
         // SAFETY: GetCount has no arguments.
@@ -364,6 +445,68 @@ mod tests {
         assert!(released.try_recv().is_err());
         drop((command, with_selection));
         released.try_recv().unwrap();
+    }
+
+    #[test]
+    fn a_site_is_kept_and_one_without_a_view_keeps_the_order() {
+        let dir = TempDir::new().unwrap();
+        let files = files(&dir, &["15.png", "16.png", "01.png"]);
+        let (command, sent, _released) = command();
+        let items = shell_items(&files).unwrap();
+        let with_site: IObjectWithSite = command.cast().unwrap();
+        // SAFETY: GetSite writes only the interface it returns.
+        let none: windows::core::Result<IUnknown> = unsafe { with_site.GetSite() };
+        assert!(none.is_err());
+        // Any object serves as a site; this one offers no folder view.
+        let site: IUnknown = items.cast().unwrap();
+        // SAFETY: the site and the array are live objects.
+        unsafe {
+            with_site.SetSite(&site).unwrap();
+            command
+                .cast::<IObjectWithSelection>()
+                .unwrap()
+                .SetSelection(&items)
+                .unwrap();
+        }
+        // SAFETY: the site is asked for as an interface it has.
+        let back: IUnknown = unsafe { with_site.GetSite() }.unwrap();
+        assert_eq!(back, site);
+
+        // SAFETY: Execute has no arguments.
+        unsafe { command.Execute() }.unwrap();
+        let (sent_files, select) = sent.try_recv().unwrap();
+        assert_eq!(canonical(&sent_files), canonical(&files));
+        assert_eq!(select, 0);
+
+        // SAFETY: a null site clears it.
+        unsafe { with_site.SetSite(None) }.unwrap();
+        // SAFETY: GetSite writes only the interface it returns.
+        let cleared: windows::core::Result<IUnknown> = unsafe { with_site.GetSite() };
+        assert!(cleared.is_err());
+    }
+
+    #[test]
+    fn the_view_orders_the_files_and_the_focused_one_is_selected() {
+        let path = |name: &str| PathBuf::from(format!(r"C:\shots\{name}"));
+        let names = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        // Explorer starts at the focused file and wraps.
+        let given: Vec<_> = ["15.png", "16.png", "01.png", "02.png"].map(path).into();
+        let view: Vec<_> = ["01.png", "02.png", "15.png", "16.png"].map(path).into();
+        let (files, select) = in_view_order(given.clone(), &view);
+        assert_eq!(names(&files), ["01.png", "02.png", "15.png", "16.png"]);
+        assert_eq!(select, 2);
+
+        // A file the view does not list goes last; no view keeps the order.
+        let (files, select) = in_view_order(given.clone(), &view[1..]);
+        assert_eq!(names(&files), ["02.png", "15.png", "16.png", "01.png"]);
+        assert_eq!(select, 1);
+        assert_eq!(in_view_order(given.clone(), &[]), (given, 0));
+        assert_eq!(in_view_order(Vec::new(), &view), (Vec::new(), 0));
     }
 
     #[test]
