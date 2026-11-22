@@ -121,6 +121,20 @@ impl PixelRect {
             height,
         }
     }
+
+    /// The whole of an image of `size`.
+    pub const fn whole(size: PixelSize) -> Self {
+        PixelRect::new(0, 0, size.width, size.height)
+    }
+
+    /// The part of this rectangle inside an image of `size`, or `None` if
+    /// none of it is.
+    pub fn within(self, size: PixelSize) -> Option<PixelRect> {
+        let right = self.x.saturating_add(self.width).min(size.width);
+        let bottom = self.y.saturating_add(self.height).min(size.height);
+        (right > self.x && bottom > self.y)
+            .then(|| PixelRect::new(self.x, self.y, right - self.x, bottom - self.y))
+    }
 }
 
 impl From<PixelRect> for Rect {
@@ -341,6 +355,26 @@ mod tests {
         );
         assert_eq!(PixelSize::new(3, 4).width, 3);
         assert_eq!(Size::new(3.0, 4.0).height, 4.0);
+    }
+
+    #[test]
+    fn pixel_rects_are_cut_to_an_image() {
+        let size = PixelSize::new(100, 50);
+        assert_eq!(PixelRect::whole(size), PixelRect::new(0, 0, 100, 50));
+        assert_eq!(
+            PixelRect::new(10, 20, 30, 10).within(size),
+            Some(PixelRect::new(10, 20, 30, 10))
+        );
+        assert_eq!(
+            PixelRect::new(90, 40, 30, 30).within(size),
+            Some(PixelRect::new(90, 40, 10, 10))
+        );
+        assert_eq!(PixelRect::new(100, 0, 5, 5).within(size), None);
+        assert_eq!(PixelRect::new(0, 0, 0, 5).within(size), None);
+        assert_eq!(
+            PixelRect::new(5, 5, u32::MAX, u32::MAX).within(size),
+            Some(PixelRect::new(5, 5, 95, 45))
+        );
     }
 
     #[test]
