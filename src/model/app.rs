@@ -518,7 +518,9 @@ pub enum Key {
     /// A function key, F1 to F24.
     Function(u8),
     /// A letter, digit or punctuation key, as the lower-case character it
-    /// types without Shift: R with or without Shift is `Char('r')`.
+    /// types without Shift: R with or without Shift is `Char('r')`. The one
+    /// exception is `Char('?')`, which is the character typed, whichever key
+    /// types it, since `?` is on a different key in each keyboard layout.
     Char(char),
 }
 
@@ -687,6 +689,32 @@ pub const fn frame_colours(dark: bool, active: bool) -> FrameColours {
     }
 }
 
+/// The heading of the list of shortcuts that `?` and F1 show.
+pub const SHORTCUTS_TITLE: &str = "Keyboard shortcuts";
+
+/// The list of shortcuts that `?` and F1 show: the keys, and what they do.
+pub const SHORTCUTS: [(&str, &str); 16] = [
+    ("← → ↑ ↓, Page Up, Page Down", "Previous or next image"),
+    ("Home, End", "First or last image"),
+    ("Wheel, pinch, + −", "Zoom"),
+    ("0", "Fit to window"),
+    ("1", "Actual size"),
+    ("Drag", "Pan"),
+    ("R, Shift+R", "Turn clockwise, anticlockwise"),
+    (
+        "Delete, Ctrl+W",
+        "Close the image, or delete the selected mark",
+    ),
+    ("Ctrl+C", "Copy the image, or the selected mark's area"),
+    ("Ctrl+V", "Paste"),
+    ("Right-drag, M", "Draw a mark, or toggle mark mode"),
+    ("F2", "Edit the selected mark's note"),
+    ("Ctrl+Enter", "Finish marking"),
+    ("C", "Compare view"),
+    ("S", "Switch between compare and split view"),
+    ("?, F1", "Show or hide this list"),
+];
+
 /// How long the zoom readout takes to fade in.
 const READOUT_FADE_IN: Duration = Duration::from_millis(150);
 /// How long after the last zoom change the readout starts to fade out.
@@ -754,6 +782,8 @@ pub struct App {
     marks: Marks,
     compare: Option<Compare>,
     mark_mode: bool,
+    /// Whether the list of shortcuts is shown.
+    shortcuts: bool,
     selected_mark: Option<MarkId>,
     note: Option<Note>,
     gesture: Gesture,
@@ -930,6 +960,7 @@ impl App {
             marks: Marks::new(),
             compare: None,
             mark_mode: false,
+            shortcuts: false,
             selected_mark: None,
             note: None,
             gesture: Gesture::Idle,
@@ -1163,6 +1194,15 @@ impl App {
         if modifiers.alt {
             return;
         }
+        if matches!(key, Key::Char('?') | Key::Function(1)) && !modifiers.ctrl {
+            self.shortcuts = !self.shortcuts;
+            return;
+        }
+        // Any other key hides the list of shortcuts, and Escape does only
+        // that; the others then do their usual job.
+        if std::mem::take(&mut self.shortcuts) && key == Key::Escape {
+            return;
+        }
         if modifiers.ctrl {
             match key {
                 Key::Enter => self.finish_marking(effects),
@@ -1384,6 +1424,10 @@ impl App {
     fn pointer_down(&mut self, button: Button, at: Point, effects: &mut Vec<Effect>) {
         self.pointer = Some(at);
         if self.gesture != Gesture::Idle {
+            return;
+        }
+        // A click while the list of shortcuts shows only hides it.
+        if std::mem::take(&mut self.shortcuts) {
             return;
         }
         self.commit_note();
@@ -2704,10 +2748,87 @@ impl App {
             });
         }
 
+        if self.shortcuts {
+            self.shortcuts_items(&mut items);
+        }
+
         Scene {
             size: self.size,
             background,
             items,
+        }
+    }
+
+    /// The list of shortcuts: a panel in the middle of the window with the
+    /// keys on the left and what they do on the right, shrunk to fit a small
+    /// window.
+    fn shortcuts_items(&self, items: &mut Vec<Item>) {
+        let colours = theme_colours(self.dark);
+        let scale = self.scale();
+        // Column widths are estimated from character counts, as the model
+        // cannot measure text; the renderer trims any text that overflows.
+        let width_of = |text: &str| text.chars().count() as f64 * 0.55 * 14.0;
+        let keys = SHORTCUTS
+            .iter()
+            .map(|(keys, _)| width_of(keys))
+            .fold(0.0, f64::max);
+        let actions = SHORTCUTS
+            .iter()
+            .map(|(_, action)| width_of(action))
+            .fold(width_of(SHORTCUTS_TITLE), f64::max);
+        let (padding, gap, title_row, row) = (20.0, 24.0, 36.0, 26.0);
+        let width = 2.0 * padding + keys + gap + actions;
+        let height = 2.0 * padding + title_row + SHORTCUTS.len() as f64 * row;
+        let margin = 16.0 * scale;
+        let room = |window: u32| (f64::from(window) - 2.0 * margin).max(0.0);
+        let fit = scale
+            .min(room(self.size.width) / width)
+            .min(room(self.size.height) / height);
+
+        let panel = Rect::new(
+            (f64::from(self.size.width) - width * fit) / 2.0,
+            (f64::from(self.size.height) - height * fit) / 2.0,
+            width * fit,
+            height * fit,
+        );
+        items.push(Item::FillRect {
+            rect: panel,
+            colour: colours.panel.with_alpha(0.95),
+        });
+        items.push(Item::StrokeRect {
+            rect: panel,
+            colour: colours.line,
+            width: scale,
+            dashed: false,
+        });
+        let left = panel.x + padding * fit;
+        let top = panel.y + padding * fit;
+        items.push(Item::Text {
+            text: SHORTCUTS_TITLE.to_string(),
+            rect: Rect::new(left, top, (keys + gap + actions) * fit, title_row * fit),
+            colour: colours.text,
+            size: 16.0 * fit,
+            align: Align::Start,
+            bold: true,
+        });
+        for (index, (shortcut, action)) in SHORTCUTS.iter().enumerate() {
+            let y = top + (title_row + index as f64 * row) * fit;
+            items.push(Item::Text {
+                text: (*shortcut).to_string(),
+                rect: Rect::new(left, y, keys * fit, row * fit),
+                colour: colours.accent,
+                size: 14.0 * fit,
+                align: Align::Start,
+                bold: false,
+            });
+            items.push(Item::Text {
+                text: (*action).to_string(),
+                rect: Rect::new(left + (keys + gap) * fit, y, actions * fit, row * fit),
+                colour: colours.text,
+                size: 14.0 * fit,
+                align: Align::Start,
+                bold: false,
+            });
         }
     }
 
@@ -4532,6 +4653,100 @@ mod session_tests {
         session.wait(10);
         session.key(Key::Char('0'));
         assert_eq!(session.app.zoom_changed, changed);
+    }
+
+    #[test]
+    fn question_mark_and_f1_show_and_hide_the_shortcuts() {
+        let mut session = three_images();
+        let shown =
+            |session: &Session| texts(&session.app.scene()).contains(&SHORTCUTS_TITLE.to_string());
+        let selected = |session: &Session| session.app.set().selected();
+        let first = selected(&session);
+        assert!(!shown(&session));
+
+        // `?` arrives with Shift on most layouts.
+        let effects = session.key_with(Key::Char('?'), Modifiers::SHIFT);
+        assert!(effects.contains(&Effect::Redraw));
+        assert!(shown(&session));
+        let scene = texts(&session.app.scene());
+        for (keys, action) in SHORTCUTS {
+            assert!(scene.contains(&keys.to_string()), "{keys}");
+            assert!(scene.contains(&action.to_string()), "{action}");
+        }
+        session.key(Key::Char('?'));
+        assert!(!shown(&session));
+        session.key(Key::Function(1));
+        assert!(shown(&session));
+        session.key(Key::Function(1));
+        assert!(!shown(&session));
+        // Ctrl+F1 is not F1.
+        session.key_with(Key::Function(1), Modifiers::CTRL);
+        assert!(!shown(&session));
+
+        // Escape only hides the list.
+        session.key(Key::Char('m'));
+        session.key(Key::Function(1));
+        session.key(Key::Escape);
+        assert!(!shown(&session));
+        assert!(session.app.mark_mode());
+        session.key(Key::Escape);
+        assert!(!session.app.mark_mode());
+
+        // Another key hides it and does its usual job.
+        session.key(Key::Char('?'));
+        session.key(Key::Right);
+        assert!(!shown(&session));
+        assert_ne!(selected(&session), first);
+
+        // A click only hides it.
+        session.key(Key::Char('?'));
+        session.down(Button::Left, 400.0, 300.0);
+        assert!(!shown(&session));
+        assert_eq!(session.app.gesture, Gesture::Idle);
+    }
+
+    #[test]
+    fn the_shortcuts_shrink_to_fit_a_small_window() {
+        let mut session = three_images();
+        let sizes = |session: &Session| {
+            session
+                .app
+                .scene()
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Text {
+                        text, rect, size, ..
+                    } if text == "Pan" => Some((*rect, *size)),
+                    _ => None,
+                })
+                .next()
+        };
+        session.key(Key::Char('?'));
+        let (_, size) = sizes(&session).unwrap();
+        assert_eq!(size, 14.0);
+
+        session.send(Input::Resize {
+            size: PixelSize::new(320, 240),
+        });
+        let (rect, size) = sizes(&session).unwrap();
+        assert!(size < 14.0, "{size}");
+        assert!(rect.right() <= 320.0 && rect.bottom() <= 240.0, "{rect:?}");
+        let Some(Item::FillRect { rect: panel, .. }) = session
+            .app
+            .scene()
+            .items
+            .iter()
+            .find(|item| matches!(item, Item::FillRect { colour, .. } if colour.a == 0.95))
+            .cloned()
+        else {
+            panic!("no panel");
+        };
+        assert!(panel.x >= 16.0 && panel.y >= 16.0, "{panel:?}");
+        assert!(
+            panel.right() <= 304.0 && panel.bottom() <= 224.0,
+            "{panel:?}"
+        );
     }
 
     #[test]

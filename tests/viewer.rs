@@ -307,6 +307,37 @@ fn images_are_closed_and_groups_cleared() {
 }
 
 #[test]
+fn question_mark_shows_the_shortcuts_and_escape_hides_them() {
+    let dir = TempDir::new().unwrap();
+    let viewer = viewer(&[]);
+    debug_input(&viewer, r#"{"type":"dpi","dpi":96}"#);
+    debug_input(
+        &viewer,
+        r#"{"type":"resize","size":{"width":800,"height":600}}"#,
+    );
+    // A point in the panel's top margin, clear of its text.
+    let probe = |name: &str| {
+        let path = dir.join(name);
+        let _: Reply = viewer.seer_json([Path::new("screenshot"), &path]);
+        read_image(&path).unwrap().get(400, 58)
+    };
+    assert_eq!(probe("before.png"), BACKGROUND);
+
+    debug_input(&viewer, r#"{"type":"key","key":"?"}"#);
+    let panel = probe("shown.png");
+    // The dark theme's panel colour, nearly opaque over the background.
+    let near = |value: u8, expected: u8| value.abs_diff(expected) <= 2;
+    assert!(
+        near(panel.r, 0x22) && near(panel.g, 0x1C) && near(panel.b, 0x19),
+        "{panel:?}"
+    );
+
+    debug_input(&viewer, r#"{"type":"key","key":"escape"}"#);
+    assert_eq!(probe("hidden.png"), BACKGROUND);
+    assert!(viewer.quit().success());
+}
+
+#[test]
 fn the_viewer_reports_its_start_up_timings() {
     let dir = TempDir::new().unwrap();
     let (path, _) = quadrants(&dir, "photo.png", [Rgba::BLUE; 4]);

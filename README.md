@@ -98,6 +98,7 @@ Two hidden commands exist for testing:
 
 ### Keys and mouse
 
+- `?` or F1 shows a list of the keys in the middle of the window, and pressing either again hides it. Escape or a click also hides it, and any other key hides it and then does its usual job. `?` is read as the character typed, so it works whichever key types it in the keyboard layout.
 - The arrow keys, Page Up and Page Down move to the previous or next image; Home and End move to the first and last.
 - The wheel (with or without Ctrl), a touchpad pinch, and `+` and `-` zoom about the pointer (the keys about the middle). `0` fits the image to the window, never enlarging a small one, and `1` shows it at 100%. The zoom's percentage shows at the bottom of the image while it changes and fades a second after. From 400% up, pixels are drawn as sharp squares so they can be inspected; below that the image is scaled smoothly.
 - Dragging with the left or middle button pans.
