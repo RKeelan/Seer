@@ -51,6 +51,10 @@ pub enum Request {
         /// flashes its taskbar button, and a new one shows without activating.
         #[serde(default, skip_serializing_if = "is_false")]
         activate: bool,
+        /// The index in `files` of the file to select. Without it, or if that
+        /// file cannot be opened, the first file opened is selected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<usize>,
     },
     /// Report the set and the view (`seer list`).
     List,
@@ -425,6 +429,7 @@ mod tests {
             group: Some("run 3".into()),
             compare: true,
             activate: true,
+            select: Some(1),
         });
         round_trip_request(Request::List);
         round_trip_request(Request::Close {
@@ -569,6 +574,7 @@ mod tests {
                 group: None,
                 compare: false,
                 activate: false,
+                select: None,
             }
         );
         assert_eq!(

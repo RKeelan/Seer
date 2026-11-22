@@ -16,7 +16,7 @@ Download the zip from the latest [release](https://github.com/RKeelan/Seer/relea
 
 - It copies both programs to `%LOCALAPPDATA%\Programs\Seer` and adds that directory to your `PATH`, so terminals opened afterwards find `seer`.
 - It registers Seer for the image types it reads, so it appears in Explorer's Open with menu and in Settings > Apps > Default apps. It never makes itself the default: choose it there, or in Open with > Choose another app, for each type you want it to open.
-- It registers the open verb so that Explorer hands a whole selection to one `seerw.exe` through COM, in Explorer's order, and the window selects the first of them. The COM class is a local server in `seerw.exe`, registered for the current user only.
+- It registers the open verb so that Explorer hands a whole selection to one `seerw.exe` through COM. The images join the window in the folder's order, whatever it is sorted by, and the one that had the focus is selected. The COM class is a local server in `seerw.exe`, registered for the current user only.
 
 Installing again replaces the programs, even while the viewer is running; the running viewer keeps its old version until it is next started. `seer uninstall` removes the programs, the `PATH` entry and the registrations, and leaves other programs' registrations for the same types alone. The directory the zip was unpacked to can then be deleted.
 

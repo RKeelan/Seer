@@ -445,6 +445,7 @@ mod tests {
             group: None,
             compare: false,
             activate: false,
+            select: None,
         }
     }
 
@@ -594,6 +595,7 @@ mod tests {
             group: None,
             compare: false,
             activate: true,
+            select: None,
         };
         assert!(matches!(connection.send(&activate), Ok(Reply::Opened(_))));
     }

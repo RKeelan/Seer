@@ -307,6 +307,7 @@ fn build_request(command: &Command, input: &mut dyn Read) -> Result<Request> {
                 group: open.group.clone(),
                 compare: open.compare,
                 activate: open.activate,
+                select: None,
             }
         }
         Command::List => Request::List,
@@ -785,6 +786,7 @@ mod tests {
                 group: Some("run 3".into()),
                 compare: true,
                 activate: true,
+                select: None,
             }
         );
         assert_eq!(parse(&["list"]).unwrap(), Request::List);
