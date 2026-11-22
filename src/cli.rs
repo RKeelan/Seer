@@ -13,8 +13,10 @@
 //!   are reported on stderr and in the JSON's `not_found`).
 //! - 1: unexpected failure.
 //! - 2: usage error.
-//! - 3: no viewer is running (every command except `open`, which starts one).
-//! - 4: one or more files could not be opened; the others were.
+//! - 3: no viewer is running (every command except `open` and `paste`, which
+//!   start one).
+//! - 4: one or more files could not be opened; the others were. Also when
+//!   `paste` finds no image on the clipboard (`no_images`).
 //! - 5: `marks --wait` timed out.
 
 use std::ffi::OsString;
@@ -60,6 +62,9 @@ enum Command {
     /// Add images to the viewer's window, starting the viewer if none is
     /// running.
     Open(OpenArgs),
+    /// Open a temporary copy of the files or the image on the clipboard,
+    /// starting the viewer if none is running.
+    Paste(PasteArgs),
     /// Report the open images and how the selected one is shown.
     List,
     /// Remove images by id or path.
@@ -109,6 +114,20 @@ struct OpenArgs {
     /// the order Explorer sorts them by name.
     #[arg(required = true, value_name = "FILES")]
     files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct PasteArgs {
+    /// Put the image in this group.
+    #[arg(long, value_name = "G")]
+    group: Option<String>,
+    /// The image's caption.
+    #[arg(long, value_name = "C")]
+    caption: Option<String>,
+    /// Bring the window to the foreground instead of flashing its taskbar
+    /// button.
+    #[arg(long)]
+    activate: bool,
 }
 
 #[derive(Debug, Args)]
@@ -274,9 +293,11 @@ fn execute(cli: &Cli, context: &mut Context) -> Result<Reply> {
     let instance = InstanceName::from_environment(cli.instance.as_deref())?;
     let request = build_request(&cli.command, context.input)?;
     match request {
-        Request::Open { activate, .. } => client::send_or_start(&instance, &request, || {
-            (context.start_viewer)(&instance, activate)
-        }),
+        Request::Open { activate, .. } | Request::Paste { activate, .. } => {
+            client::send_or_start(&instance, &request, || {
+                (context.start_viewer)(&instance, activate)
+            })
+        }
         _ => client::send(&instance, &request),
     }
 }
@@ -318,6 +339,11 @@ fn build_request(command: &Command, input: &mut dyn Read) -> Result<Request> {
                 select: None,
             }
         }
+        Command::Paste(paste) => Request::Paste {
+            group: paste.group.clone(),
+            caption: paste.caption.clone(),
+            activate: paste.activate,
+        },
         Command::List => Request::List,
         Command::Close(close) if close.all => Request::CloseAll,
         Command::Close(close) => Request::Close {
@@ -796,6 +822,22 @@ mod tests {
                 compare: true,
                 activate: true,
                 select: None,
+            }
+        );
+        assert_eq!(
+            parse(&["paste", "--group", "g", "--caption", "menu", "--activate"]).unwrap(),
+            Request::Paste {
+                group: Some("g".into()),
+                caption: Some("menu".into()),
+                activate: true,
+            }
+        );
+        assert_eq!(
+            parse(&["paste"]).unwrap(),
+            Request::Paste {
+                group: None,
+                caption: None,
+                activate: false,
             }
         );
         assert_eq!(parse(&["list"]).unwrap(), Request::List);

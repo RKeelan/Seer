@@ -59,6 +59,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         select: Option<usize>,
     },
+    /// Copy the files or the image on the clipboard to files of the viewer's,
+    /// deleted when closed, and open them (`seer paste`). Answered with
+    /// [`Reply::Opened`], or [`ErrorCode::NoImages`] when the clipboard holds
+    /// neither.
+    Paste {
+        /// The group the image joins, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        /// The caption shown with the image, if any. Files copied together
+        /// each get it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        /// Bring the window to the foreground, as with [`Request::Open`].
+        #[serde(default, skip_serializing_if = "is_false")]
+        activate: bool,
+    },
     /// Report the set and the view (`seer list`).
     List,
     /// Remove the given images (`seer close <id or path>…`).
@@ -474,6 +490,16 @@ mod tests {
             ],
         });
         round_trip_request(Request::DebugTimings);
+        round_trip_request(Request::Paste {
+            group: Some("run 3".into()),
+            caption: Some("broken".into()),
+            activate: true,
+        });
+        round_trip_request(Request::Paste {
+            group: None,
+            caption: None,
+            activate: false,
+        });
     }
 
     #[test]

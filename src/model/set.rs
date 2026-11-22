@@ -101,7 +101,7 @@ fn list_images(folder: &Path) -> Result<Vec<PathBuf>> {
 
 /// Whether a file's extension is one Seer reads: those it registers for, and
 /// SVG.
-fn is_image_name(path: &Path) -> bool {
+pub(crate) fn is_image_name(path: &Path) -> bool {
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };

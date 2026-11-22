@@ -2,6 +2,7 @@
 //!
 //! - [`args`]: the command line.
 //! - [`clipboard`]: copying images to the clipboard.
+//! - [`paste`]: opening what is on the clipboard.
 //! - [`execute`]: taking a selection from Explorer through COM.
 //! - [`window`]: the window class and procedure.
 //! - [`note`]: the note field.
@@ -52,6 +53,7 @@ pub mod clipboard;
 pub mod execute;
 pub mod log;
 pub mod note;
+pub mod paste;
 pub mod theme;
 pub mod timing;
 pub mod watch;
@@ -78,12 +80,14 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use self::args::{RunArgs, ViewerArgs};
-use self::clipboard::{Copier, Destination};
+use self::clipboard::{Clipboard, Copier};
 use self::note::NoteField;
+use self::paste::Paster;
 use self::timing::Timings;
 use self::watch::{Reloads, Watcher};
 use self::window::{
-    Handler, WM_COPIED, WM_DECODED, WM_DEVICE_READY, WM_FILES_CHANGED, WM_REQUEST, Window,
+    Handler, WM_COPIED, WM_DECODED, WM_DEVICE_READY, WM_FILES_CHANGED, WM_PASTED, WM_REQUEST,
+    Window,
 };
 use crate::decode::cache;
 use crate::decode::gif::Animation;
@@ -95,7 +99,7 @@ use crate::ipc::instance::{InstanceMutex, InstanceName};
 use crate::ipc::server::{self, Responder, Server};
 use crate::model::ImageId;
 use crate::model::animation::Playback;
-use crate::model::app::{App, Config, Cursor, DecodeTarget, Effect, Input, RequestId};
+use crate::model::app::{App, Config, Cursor, DecodeTarget, Effect, Input, Paste, RequestId};
 use crate::model::geometry::{PixelRect, PixelSize, Rect};
 use crate::model::set::DiskFiles;
 use crate::protocol::{OpenFile, Reply, Request, Response};
@@ -266,9 +270,7 @@ fn start(args: &RunArgs) -> Result<u8> {
         timings,
         received,
     );
-    viewer
-        .copier
-        .set_destination(Destination::for_viewer(args.headless));
+    viewer.set_clipboard(Clipboard::for_viewer(args.headless), &instance);
     if !args.headless {
         viewer.visibility = Visibility::Hidden {
             activate: !args.no_activate,
@@ -313,6 +315,12 @@ fn start(args: &RunArgs) -> Result<u8> {
     if matches!(viewer.visibility, Visibility::Hidden { .. }) {
         window::set_timer(window.hwnd(), SHOW_TIMER, EMPTY_SHOW_DELAY_MS);
     }
+    // This instance's pastes from a viewer that did not exit cleanly, and
+    // those of instances no viewer runs, are no longer anyone's.
+    if let Ok(root) = paste::root(&viewer.clipboard) {
+        paste::clean_up(&root, instance.as_str(), InstanceName::is_taken);
+    }
+    let pasted_folder = viewer.pasted_folder.clone().ok();
 
     let server = Server::start(
         &instance,
@@ -331,6 +339,10 @@ fn start(args: &RunArgs) -> Result<u8> {
     // Dropping the viewer answers any request it still holds with an error.
     drop(window.take_handler());
     server.stop(REPLY_TIMEOUT);
+    // Pasted files are temporary.
+    if let Some(folder) = pasted_folder {
+        let _ = std::fs::remove_dir_all(folder);
+    }
     log::write(format_args!("exited"));
     Ok(0)
 }
@@ -573,8 +585,14 @@ struct Viewer {
     /// The image the selection last moved to, until a frame showing it is
     /// presented.
     navigation: Option<ImageId>,
+    /// The clipboard copies go to and pastes come from.
+    clipboard: Clipboard,
+    /// This instance's pasted folder, or why it has none.
+    pasted_folder: Result<PathBuf>,
     /// Prepares copies for the clipboard off the UI thread.
     copier: Copier,
+    /// Saves pasted images off the UI thread.
+    paster: Paster,
 }
 
 impl Viewer {
@@ -615,9 +633,12 @@ impl Viewer {
             reloads: Reloads::new(),
             held: Some(Vec::new()),
             navigation: None,
-            copier: Copier::new(Destination::Unavailable, move || {
+            clipboard: Clipboard::Unavailable,
+            pasted_folder: Err(Clipboard::unavailable()),
+            copier: Copier::new(Clipboard::Unavailable, move || {
                 window::post(posted_to, WM_COPIED)
             }),
+            paster: Paster::new(move || window::post(posted_to, WM_PASTED)),
         }
     }
 
@@ -764,6 +785,15 @@ impl Viewer {
                     Ok(capture) => self.copier.submit(capture, rotation),
                     Err(error) => self.copy_failed(error),
                 },
+                Effect::Paste { paste } => self.paste(paste),
+                Effect::Discard { path } => {
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        log::write(format_args!(
+                            "a pasted file could not be deleted: {}",
+                            log::error(&error.into())
+                        ));
+                    }
+                }
             }
         }
     }
@@ -837,6 +867,40 @@ impl Viewer {
         let held = PixelSize::new(held.width, held.height);
         let region = clipboard::scale_region(region, size, held);
         offscreen::read_back(&self.graphics.device, bitmap, region)
+    }
+
+    /// Uses `clipboard` for copying and pasting, keeping pasted files in
+    /// `instance`'s pasted folder.
+    fn set_clipboard(&mut self, clipboard: Clipboard, instance: &InstanceName) {
+        self.copier.set_clipboard(clipboard.clone());
+        self.pasted_folder = paste::root(&clipboard).map(|root| root.join(instance.as_str()));
+        self.clipboard = clipboard;
+    }
+
+    /// Reads the clipboard and hands what it holds to the paster to copy.
+    fn paste(&mut self, paste: Paste) {
+        let read = paste::read(&self.clipboard, self.hwnd).and_then(|clip| {
+            let folder = self.pasted_folder.clone()?;
+            Ok((clip, folder))
+        });
+        match read {
+            Ok((clip, folder)) => self.paster.submit(paste::Job {
+                paste,
+                clip,
+                folder,
+            }),
+            Err(error) => self.paste_failed(paste, error),
+        }
+    }
+
+    fn paste_failed(&mut self, paste: Paste, error: Error) {
+        if error.code != ErrorCode::NoImages {
+            log::write(format_args!(
+                "the clipboard could not be pasted: {}",
+                log::error(&error)
+            ));
+        }
+        self.handle(Input::PasteFailed { paste, error });
     }
 
     fn copy_failed(&mut self, error: Error) {
@@ -1323,6 +1387,20 @@ impl Handler for Viewer {
             match ready.and_then(|ready| ready.finish(self.hwnd)) {
                 Ok(size) => self.handle(Input::Copied { size }),
                 Err(error) => self.copy_failed(error),
+            }
+        }
+        self.finish();
+    }
+
+    fn pasted(&mut self) {
+        while let Some((paste, saved)) = self.paster.try_recv() {
+            match saved {
+                Ok(saved) => self.handle(Input::Pasted {
+                    paste,
+                    files: saved.files,
+                    failed: saved.failed,
+                }),
+                Err(error) => self.paste_failed(paste, error),
             }
         }
         self.finish();
