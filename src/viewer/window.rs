@@ -53,6 +53,9 @@ pub const WM_REQUEST: u32 = WM_APP + 3;
 /// Posted to the window when watched files have changed.
 pub const WM_FILES_CHANGED: u32 = WM_APP + 4;
 
+/// Posted to the window when the copier has a copy ready.
+pub const WM_COPIED: u32 = WM_APP + 5;
+
 /// The wheel delta of one notch.
 const WHEEL_NOTCH: f64 = 120.0;
 
@@ -84,6 +87,8 @@ pub trait Handler {
     fn theme_changed(&mut self) {}
     /// Watched files have changed.
     fn files_changed(&mut self) {}
+    /// The copier has a copy ready.
+    fn copied(&mut self) {}
     /// A child edit control, such as the note field, is about to paint with
     /// `hdc`. Returns the brush for its background, having set its colours
     /// in `hdc`, or `None` for the system's colours.
@@ -553,6 +558,7 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 WM_DEVICE_READY => handler.device_ready(),
                 WM_REQUEST => handler.requests(),
                 WM_FILES_CHANGED => handler.files_changed(),
+                WM_COPIED => handler.copied(),
                 WM_TIMER => {
                     // SAFETY: KillTimer checks the handle and id.
                     let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
@@ -647,6 +653,9 @@ mod tests {
         fn theme_changed(&mut self) {
             self.push("theme".into());
         }
+        fn copied(&mut self) {
+            self.push("copied".into());
+        }
         fn control_colours(&mut self, _: HDC, _: HWND) -> Option<HBRUSH> {
             self.push("colours".into());
             Some(HBRUSH(7 as _))
@@ -701,6 +710,7 @@ mod tests {
         post(window.hwnd().0 as isize, WM_DEVICE_READY);
         post(window.hwnd().0 as isize, WM_REQUEST);
         post(window.hwnd().0 as isize, WM_FILES_CHANGED);
+        post(window.hwnd().0 as isize, WM_COPIED);
         post(0, WM_DECODED);
         pump();
         send(&window, WM_SIZE, 0, (100 << 16) | 200);
@@ -713,6 +723,7 @@ mod tests {
                 "decoded",
                 "device",
                 "requests",
+                "copied",
                 "resize 200x100",
                 "paint",
                 "timer 7",

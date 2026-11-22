@@ -23,7 +23,7 @@ Never test against the developer's own viewer or show a window on their desktop.
 - `seer screenshot <out.png>` writes what the window shows, hidden or not.
 - End the viewer with `seer quit`, never by killing it: `cargo llvm-cov` collects coverage only from processes that exit normally.
 
-In Rust tests, `testutil::HeadlessViewer` does all of this: it starts a headless viewer on a unique instance, runs `seer` against it, waits for images to load, and quits it on drop. It also gives the viewer a log directory of its own, since a headless viewer logs only when `SEER_LOG_DIR` is set, and `HeadlessViewer::log` reads what it wrote. `tests/viewer.rs` shows its use.
+In Rust tests, `testutil::HeadlessViewer` does all of this: it starts a headless viewer on a unique instance, runs `seer` against it, waits for images to load, and quits it on drop. It also gives the viewer a log directory of its own, since a headless viewer logs only when `SEER_LOG_DIR` is set, and `HeadlessViewer::log` reads what it wrote. `tests/viewer.rs` shows its use. To test copying, start it with `HeadlessViewer::start_with_env` and `SEER_CLIPBOARD_DIR` set to a temporary directory, as `tests/clipboard.rs` does; never test against the real clipboard, which is the developer's.
 
 ## Testing installation
 

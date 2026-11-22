@@ -1,12 +1,14 @@
-//! Drawing a scene to a bitmap in memory, and encoding the result as PNG, for
-//! `screenshot` and the render tests. Neither needs a window, let alone a
+//! Drawing a scene to a bitmap in memory, reading bitmaps back from the
+//! device, and encoding the result as PNG, for `screenshot`, copying to the
+//! clipboard and the render tests. None of it needs a window, let alone a
 //! visible one.
 
 use std::path::Path;
 
-use windows::Win32::Foundation::GENERIC_WRITE;
+use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U;
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_MAP_OPTIONS_READ,
+    ID2D1Bitmap,
 };
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
@@ -14,18 +16,20 @@ use windows::Win32::Graphics::Imaging::{
 };
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STREAM_SEEK_END,
+    STREAM_SEEK_SET,
 };
-use windows::core::HSTRING;
+use windows::Win32::UI::Shell::SHCreateMemStream;
 
 use crate::error::{Error, Result};
-use crate::model::geometry::PixelSize;
+use crate::model::geometry::{PixelRect, PixelSize};
 use crate::render::device::{Device, bitmap_properties, d2d_size};
 use crate::render::draw::{Bitmaps, Renderer};
 use crate::render::scene::Scene;
 
 /// A rendered image: rows top to bottom, each pixel four bytes in the order
-/// blue, green, red, alpha, with straight alpha. This is WIC's `32bppBGRA`.
+/// blue, green, red, alpha. Its alpha is straight, as in WIC's `32bppBGRA`,
+/// except as [`read_back`] returns it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Capture {
     /// The size in pixels.
@@ -53,13 +57,33 @@ pub fn render(
     // SAFETY: releasing the target only drops the context's reference.
     unsafe { context.SetTarget(None) };
     drawn?;
+    let mut capture = read_back(device, &target, PixelRect::whole(size))?;
+    unpremultiply(&mut capture.pixels);
+    Ok(capture)
+}
+
+/// Reads `region` of `bitmap`, a premultiplied bitmap on `device`, back to
+/// memory, still premultiplied; [`unpremultiply`] makes the alpha straight.
+/// `region` must lie within the bitmap.
+pub fn read_back(device: &Device, bitmap: &ID2D1Bitmap, region: PixelRect) -> Result<Capture> {
+    let size = PixelSize::new(region.width, region.height);
     let readable =
         bitmap_properties(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW);
     // SAFETY: no source data is given and the properties are a live local.
-    let copy = unsafe { context.CreateBitmap(d2d_size(size), None, 0, &readable) }?;
-    // SAFETY: both bitmaps are the same size on the same device; null points
-    // copy the whole bitmap.
-    unsafe { copy.CopyFromBitmap(None, &target, None) }?;
+    let copy = unsafe {
+        device
+            .context()
+            .CreateBitmap(d2d_size(size), None, 0, &readable)
+    }?;
+    let source = D2D_RECT_U {
+        left: region.x,
+        top: region.y,
+        right: region.x + region.width,
+        bottom: region.y + region.height,
+    };
+    // SAFETY: both bitmaps are on the same device, and the source rectangle,
+    // a live local, is the copy's size; a null point copies to its top-left.
+    unsafe { copy.CopyFromBitmap(None, bitmap, Some(&source)) }?;
     // SAFETY: the bitmap was created for CPU reads.
     let mapped = unsafe { copy.Map(D2D1_MAP_OPTIONS_READ) }?;
     let row = size.width as usize * 4;
@@ -73,12 +97,17 @@ pub fn render(
     }
     // SAFETY: the bitmap is mapped, and the slices above are no longer used.
     unsafe { copy.Unmap() }?;
-    unpremultiply(&mut pixels);
     Ok(Capture { size, pixels })
 }
 
 /// Writes `capture` to `path` as a PNG.
 pub fn write_png(path: &Path, capture: &Capture) -> Result<()> {
+    std::fs::write(path, encode_png(capture)?)?;
+    Ok(())
+}
+
+/// Encodes `capture` as a PNG file's bytes.
+pub fn encode_png(capture: &Capture) -> Result<Vec<u8>> {
     // SAFETY: initialising COM has no preconditions. It reports S_FALSE or
     // RPC_E_CHANGED_MODE when COM is already initialised on this thread, and
     // COM is usable either way, so the result is ignored.
@@ -86,10 +115,13 @@ pub fn write_png(path: &Path, capture: &Capture) -> Result<()> {
     // SAFETY: the class id is a constant and no outer object is given.
     let factory: IWICImagingFactory =
         unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }?;
+    // SAFETY: no initial contents are given.
+    let memory = unsafe { SHCreateMemStream(None) }
+        .ok_or_else(|| Error::unexpected("could not make a stream in memory"))?;
     // SAFETY: CreateStream has no arguments.
     let stream = unsafe { factory.CreateStream() }?;
-    // SAFETY: the path outlives the call.
-    unsafe { stream.InitializeFromFilename(&HSTRING::from(path), GENERIC_WRITE.0) }?;
+    // SAFETY: the memory stream is live.
+    unsafe { stream.InitializeFromIStream(&memory) }?;
     // SAFETY: the container GUID outlives the call; no vendor is preferred.
     let encoder = unsafe { factory.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()) }?;
     // SAFETY: the stream is live.
@@ -118,11 +150,23 @@ pub fn write_png(path: &Path, capture: &Capture) -> Result<()> {
     unsafe { frame.Commit() }?;
     // SAFETY: Commit has no arguments.
     unsafe { encoder.Commit() }?;
-    Ok(())
+    let mut length = 0u64;
+    // SAFETY: the out pointer is to a live local.
+    unsafe { memory.Seek(0, STREAM_SEEK_END, Some(&mut length)) }?;
+    // SAFETY: no out pointer is given.
+    unsafe { memory.Seek(0, STREAM_SEEK_SET, None) }?;
+    let length = u32::try_from(length).map_err(|_| Error::unexpected("the PNG is over 4 GB"))?;
+    let mut bytes = vec![0u8; length as usize];
+    let mut read = 0u32;
+    // SAFETY: the buffer holds `length` bytes, and the out pointer is to a
+    // live local.
+    unsafe { memory.Read(bytes.as_mut_ptr().cast(), length, Some(&mut read)) }.ok()?;
+    bytes.truncate(read as usize);
+    Ok(bytes)
 }
 
 /// Converts premultiplied BGRA to straight BGRA in place.
-fn unpremultiply(pixels: &mut [u8]) {
+pub fn unpremultiply(pixels: &mut [u8]) {
     for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = u32::from(pixel[3]);
         if alpha != 0 && alpha != 255 {
@@ -370,6 +414,24 @@ mod tests {
         write_png(&path, &capture).unwrap();
         assert_similar(&pixels, &read_image(&path).unwrap(), 0);
         assert!(write_png(&dir.join("no-such-dir").join("x.png"), &capture).is_err());
+    }
+
+    #[test]
+    fn regions_of_bitmaps_read_back_premultiplied() {
+        let device = Device::warp().unwrap();
+        let mut decoded = quadrants();
+        // The top-left pixel is half-transparent red, premultiplied.
+        decoded.pixels[..4].copy_from_slice(&[0, 0, 128, 128]);
+        let bitmap = device.create_bitmap(&decoded).unwrap();
+        let mut capture = read_back(&device, &bitmap, PixelRect::new(0, 0, 2, 4)).unwrap();
+        assert_eq!(capture.pixels[..4], [0, 0, 128, 128]);
+        unpremultiply(&mut capture.pixels);
+        assert_eq!(capture.size, PixelSize::new(2, 4));
+        let mut expected = Pixels::from_fn(2, 4, |_, y| if y < 2 { Rgba::RED } else { Rgba::BLUE });
+        expected.data[..4].copy_from_slice(&[0, 0, 255, 128]);
+        assert_eq!(to_pixels(&capture), expected);
+        let corner = read_back(&device, &bitmap, PixelRect::new(3, 3, 1, 1)).unwrap();
+        assert_eq!(corner.pixels, [255, 255, 255, 255]);
     }
 
     #[test]

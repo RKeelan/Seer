@@ -1,6 +1,7 @@
 //! The viewer, `seerw.exe`: the window, and the machinery around it.
 //!
 //! - [`args`]: the command line.
+//! - [`clipboard`]: copying images to the clipboard.
 //! - [`execute`]: taking a selection from Explorer through COM.
 //! - [`window`]: the window class and procedure.
 //! - [`note`]: the note field.
@@ -47,6 +48,7 @@
 //! the same pixels on every machine.
 
 pub mod args;
+pub mod clipboard;
 pub mod execute;
 pub mod log;
 pub mod note;
@@ -76,10 +78,13 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use self::args::{RunArgs, ViewerArgs};
+use self::clipboard::{Copier, Destination};
 use self::note::NoteField;
 use self::timing::Timings;
 use self::watch::{Reloads, Watcher};
-use self::window::{Handler, WM_DECODED, WM_DEVICE_READY, WM_FILES_CHANGED, WM_REQUEST, Window};
+use self::window::{
+    Handler, WM_COPIED, WM_DECODED, WM_DEVICE_READY, WM_FILES_CHANGED, WM_REQUEST, Window,
+};
 use crate::decode::cache;
 use crate::decode::gif::Animation;
 use crate::decode::wic::{Content, Decoded};
@@ -91,12 +96,12 @@ use crate::ipc::server::{self, Responder, Server};
 use crate::model::ImageId;
 use crate::model::animation::Playback;
 use crate::model::app::{App, Config, Cursor, DecodeTarget, Effect, Input, RequestId};
-use crate::model::geometry::{PixelSize, Rect};
+use crate::model::geometry::{PixelRect, PixelSize, Rect};
 use crate::model::set::DiskFiles;
 use crate::protocol::{OpenFile, Reply, Request, Response};
 use crate::render::device::{Composition, Device, SwapChain, hardware_device};
 use crate::render::draw::{Bitmaps, Renderer};
-use crate::render::offscreen;
+use crate::render::offscreen::{self, Capture};
 use crate::render::scene::{Item, Scene};
 
 /// The id of the request the viewer makes of itself to open the files on its
@@ -261,6 +266,9 @@ fn start(args: &RunArgs) -> Result<u8> {
         timings,
         received,
     );
+    viewer
+        .copier
+        .set_destination(Destination::for_viewer(args.headless));
     if !args.headless {
         viewer.visibility = Visibility::Hidden {
             activate: !args.no_activate,
@@ -565,6 +573,8 @@ struct Viewer {
     /// The image the selection last moved to, until a frame showing it is
     /// presented.
     navigation: Option<ImageId>,
+    /// Prepares copies for the clipboard off the UI thread.
+    copier: Copier,
 }
 
 impl Viewer {
@@ -605,6 +615,9 @@ impl Viewer {
             reloads: Reloads::new(),
             held: Some(Vec::new()),
             navigation: None,
+            copier: Copier::new(Destination::Unavailable, move || {
+                window::post(posted_to, WM_COPIED)
+            }),
         }
     }
 
@@ -742,6 +755,15 @@ impl Viewer {
                     self.watcher.unwatch(image);
                     self.reloads.forget(image);
                 }
+                Effect::Copy {
+                    image,
+                    size,
+                    region,
+                    rotation,
+                } => match self.read_for_copy(image, size, region) {
+                    Ok(capture) => self.copier.submit(capture, rotation),
+                    Err(error) => self.copy_failed(error),
+                },
             }
         }
     }
@@ -796,6 +818,33 @@ impl Viewer {
             path,
             size: capture.size,
         })
+    }
+
+    /// Reads `region` of `image`, whose full size is `size`, back from the
+    /// device for the copier, premultiplied.
+    fn read_for_copy(
+        &mut self,
+        image: ImageId,
+        size: PixelSize,
+        region: PixelRect,
+    ) -> Result<Capture> {
+        let bitmap = self
+            .bitmaps
+            .get(&image)
+            .ok_or_else(|| Error::unexpected("the image is not decoded"))?;
+        // SAFETY: GetPixelSize only reads the bitmap's size.
+        let held = unsafe { bitmap.GetPixelSize() };
+        let held = PixelSize::new(held.width, held.height);
+        let region = clipboard::scale_region(region, size, held);
+        offscreen::read_back(&self.graphics.device, bitmap, region)
+    }
+
+    fn copy_failed(&mut self, error: Error) {
+        log::write(format_args!(
+            "an image could not be copied: {}",
+            log::error(&error)
+        ));
+        self.handle(Input::CopyFailed { error });
     }
 
     /// The selected image, if the first frame should wait for its decode.
@@ -1267,6 +1316,16 @@ impl Handler for Viewer {
         {
             note.focus();
         }
+    }
+
+    fn copied(&mut self) {
+        while let Some(ready) = self.copier.try_recv() {
+            match ready.and_then(|ready| ready.finish(self.hwnd)) {
+                Ok(size) => self.handle(Input::Copied { size }),
+                Err(error) => self.copy_failed(error),
+            }
+        }
+        self.finish();
     }
 
     fn files_changed(&mut self) {

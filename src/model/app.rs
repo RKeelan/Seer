@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::decode::cache::{self, Cache};
 use crate::error::{Error, ErrorCode};
-use crate::model::geometry::{PixelRect, PixelSize, Point, Rect};
+use crate::model::geometry::{PixelRect, PixelSize, Point, Rect, Rotation};
 use crate::model::marks::{Marks, rect_between};
 use crate::model::set::{Files, OpenSet, PathKey, normalise};
 use crate::model::strip::{self, Layout, Strip};
@@ -203,6 +203,18 @@ pub enum Input {
     /// again; the rest stay unloaded until they are needed.
     #[serde(skip)]
     DeviceLost,
+    /// The window put what [`Effect::Copy`] asked for on the clipboard.
+    #[serde(skip)]
+    Copied {
+        /// The size of what was copied, after rotation.
+        size: PixelSize,
+    },
+    /// The window could not carry out [`Effect::Copy`].
+    #[serde(skip)]
+    CopyFailed {
+        /// Why.
+        error: Error,
+    },
 }
 
 /// What the window must do on the state machine's behalf.
@@ -304,6 +316,22 @@ pub enum Effect {
     WakeAfter {
         /// The delay in milliseconds.
         ms: u64,
+    },
+    /// Put part of an image's full-resolution pixels on the clipboard,
+    /// turned as the view turns it, and report the result as
+    /// [`Input::Copied`] or [`Input::CopyFailed`]. Sent only once the image
+    /// is decoded in full.
+    Copy {
+        /// The image.
+        image: ImageId,
+        /// The image's full size, which `region` is within. A bitmap held at
+        /// another size, such as a large SVG document's rasterisation, is
+        /// scaled to it.
+        size: PixelSize,
+        /// The part to copy, in the image's own pixels.
+        region: PixelRect,
+        /// The view's rotation, applied to the copy.
+        rotation: Rotation,
     },
     /// Close the window and end the process.
     Quit,
@@ -550,6 +578,8 @@ const READOUT_FADE_IN: Duration = Duration::from_millis(150);
 const READOUT_HOLD: Duration = Duration::from_millis(1000);
 /// How long the readout takes to fade out.
 const READOUT_FADE_OUT: Duration = Duration::from_millis(300);
+/// What the readout says when a copy could not be made.
+pub const COPY_FAILED: &str = "Could not copy";
 /// The interval between frames of an animation.
 const FRAME: Duration = Duration::from_millis(16);
 /// How far, in pixels at 100% scale, the pointer must move with a button
@@ -614,6 +644,12 @@ pub struct App {
     pointer: Option<Point>,
     waiters: Vec<Waiter>,
     zoom_changed: Option<Instant>,
+    /// What the readout shows in place of the zoom, such as the result of a
+    /// copy, and since when.
+    notice: Option<(String, Instant)>,
+    /// A copy asked for and not yet sent, waiting for its image's full
+    /// decode.
+    copy: Option<CopyAsk>,
     strip: Strip,
     shown: Shown,
     cache: Cache,
@@ -724,6 +760,14 @@ impl Gesture {
     }
 }
 
+/// A copy asked for with Ctrl+C: the image, and the part of it a selected
+/// mark covers, or `None` for all of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CopyAsk {
+    image: ImageId,
+    region: Option<PixelRect>,
+}
+
 /// A `marks --wait` request not yet answered.
 struct Waiter {
     id: RequestId,
@@ -774,6 +818,8 @@ impl App {
             pointer: None,
             waiters: Vec::new(),
             zoom_changed: None,
+            notice: None,
+            copy: None,
             strip: Strip::default(),
             shown: Shown {
                 title: None,
@@ -893,6 +939,10 @@ impl App {
                 }
             }
             Input::DeviceLost => self.device_lost(),
+            Input::Copied { size } => {
+                self.notify(format!("Copied {} × {}", size.width, size.height));
+            }
+            Input::CopyFailed { .. } => self.notify(COPY_FAILED.to_string()),
         }
     }
 
@@ -939,6 +989,7 @@ impl App {
             match key {
                 Key::Enter => self.finish_marking(effects),
                 Key::Char('w') => self.close_selected(effects),
+                Key::Char('c') => self.ask_copy(),
                 Key::Plus | Key::Minus | Key::Char('0') | Key::Char('1') => self.zoom_key(key),
                 _ => {}
             }
@@ -1058,7 +1109,62 @@ impl App {
         change(self.view_mut(pane.image), frame, at);
         if self.view(pane.image).zoom(frame) != before {
             self.zoom_changed = Some(self.now);
+            self.notice = None;
         }
+    }
+
+    /// Asks to copy the selected mark's part of its image, or with no mark
+    /// selected the whole selected image. [`App::send_copy`] sends it once
+    /// the image is decoded in full.
+    fn ask_copy(&mut self) {
+        let mark = self.selected_mark.and_then(|mark| self.marks.get(mark));
+        self.copy = match mark {
+            Some(mark) => Some(CopyAsk {
+                image: mark.image,
+                region: Some(mark.rect),
+            }),
+            None => self.set.selected().map(|image| CopyAsk {
+                image,
+                region: None,
+            }),
+        };
+    }
+
+    /// Sends the copy asked for once its image is decoded in full, and
+    /// forgets it if the image fails to decode or is no longer shown.
+    fn send_copy(&mut self, shown: &[ImageId], effects: &mut Vec<Effect>) {
+        let Some(ask) = self.copy else {
+            return;
+        };
+        let Some(state) = self.images.get(&ask.image) else {
+            self.copy = None;
+            return;
+        };
+        if !shown.contains(&ask.image) || state.state == LoadState::Failed {
+            self.copy = None;
+            return;
+        }
+        let (LoadState::Loaded, Some(size)) = (state.state, state.size) else {
+            return;
+        };
+        self.copy = None;
+        // A mark made before the file changed may lie partly outside it now.
+        let region = ask.region.unwrap_or(PixelRect::whole(size)).within(size);
+        match region {
+            Some(region) => effects.push(Effect::Copy {
+                image: ask.image,
+                size,
+                region,
+                rotation: self.view(ask.image).rotation(),
+            }),
+            None => self.notify(COPY_FAILED.to_string()),
+        }
+    }
+
+    /// Shows `text` in the readout, in place of the zoom.
+    fn notify(&mut self, text: String) {
+        self.notice = Some((text, self.now));
+        self.zoom_changed = None;
     }
 
     fn toggle_compare(&mut self) {
@@ -1753,7 +1859,15 @@ impl App {
         {
             self.zoom_changed = None;
         }
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, shown)| self.now - *shown >= READOUT_HOLD + READOUT_FADE_OUT)
+        {
+            self.notice = None;
+        }
         let shown: Vec<ImageId> = panes.iter().map(|pane| pane.image).collect();
+        self.send_copy(&shown, effects);
         self.schedule(&shown, effects);
         self.schedule_strip(effects);
     }
@@ -1908,7 +2022,7 @@ impl App {
     }
 
     fn next_wake(&self) -> Option<Instant> {
-        let readout = self.zoom_changed.map(|changed| {
+        let readout = self.readout_since().map(|changed| {
             let age = self.now - changed;
             if age < READOUT_FADE_IN || age >= READOUT_HOLD {
                 self.now + FRAME
@@ -2191,8 +2305,16 @@ impl App {
         ))
     }
 
+    /// When the readout was last started, by a zoom or a notice.
+    fn readout_since(&self) -> Option<Instant> {
+        match &self.notice {
+            Some((_, since)) => Some(*since),
+            None => self.zoom_changed,
+        }
+    }
+
     fn readout_opacity(&self) -> Option<f32> {
-        let age = self.now - self.zoom_changed?;
+        let age = self.now - self.readout_since()?;
         let opacity = if age < READOUT_FADE_IN {
             age.as_secs_f64() / READOUT_FADE_IN.as_secs_f64()
         } else if age < READOUT_HOLD {
@@ -2269,8 +2391,13 @@ impl App {
         if let (Some(opacity), Some(pane)) = (self.readout_opacity(), self.selected_pane())
             && let Some(frame) = self.frame(&pane)
         {
-            let zoom = self.view(pane.image).zoom(frame);
-            let (width, height) = (80.0 * scale, 28.0 * scale);
+            let words = match &self.notice {
+                Some((notice, _)) => notice.clone(),
+                None => format!("{:.0}%", self.view(pane.image).zoom(frame) * 100.0),
+            };
+            // Wide enough for the zoom, or roughly for a notice's characters.
+            let characters = words.chars().count() as f64;
+            let (width, height) = ((characters * 8.0 + 32.0).max(80.0) * scale, 28.0 * scale);
             let rect = Rect::new(
                 pane.viewport.x + (pane.viewport.width - width) / 2.0,
                 pane.viewport.bottom() - height - 16.0 * scale,
@@ -2282,7 +2409,7 @@ impl App {
                 colour: BLACK.with_alpha(0.6 * opacity),
             });
             items.push(Item::Text {
-                text: format!("{:.0}%", zoom * 100.0),
+                text: words,
                 rect,
                 colour: WHITE.with_alpha(opacity),
                 size: 14.0 * scale,
@@ -4677,5 +4804,192 @@ mod session_tests {
         let earlier = session.now - Duration::from_secs(1);
         session.app.handle(Input::Tick, earlier);
         assert_eq!(session.app.now, session.now);
+    }
+
+    /// The copies asked for: each one's image, size, region and rotation.
+    fn copies(effects: &[Effect]) -> Vec<(u32, PixelSize, PixelRect, Rotation)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Copy {
+                    image,
+                    size,
+                    region,
+                    rotation,
+                } => Some((image.0, *size, *region, *rotation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn copy(session: &mut Session) -> Vec<(u32, PixelSize, PixelRect, Rotation)> {
+        copies(&session.key_with(Key::Char('c'), Modifiers::CTRL))
+    }
+
+    /// The readout's text, if it shows.
+    fn readout(session: &Session) -> Option<String> {
+        session
+            .app
+            .scene()
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Text { text, .. } if text.starts_with("Co") || text.ends_with('%') => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_shown_image_as_turned() {
+        let mut session = Session::new();
+        // Nothing to copy.
+        assert!(copy(&mut session).is_empty());
+        session.open(&[r"C:\shots\one.png"]);
+        session.decode(1, 1600, 1200);
+        let size = PixelSize::new(1600, 1200);
+        let whole = PixelRect::whole(size);
+        assert_eq!(copy(&mut session), [(1, size, whole, Rotation::None)]);
+        // Each copy is sent once.
+        assert!(copies(&session.send(Input::Tick)).is_empty());
+        session.key(Key::Char('r'));
+        assert_eq!(
+            copy(&mut session),
+            [(1, size, whole, Rotation::Clockwise90)]
+        );
+
+        // The window reports the result in the readout, in place of the zoom.
+        let effects = session.send(Input::Copied {
+            size: PixelSize::new(1200, 1600),
+        });
+        assert!(effects.contains(&Effect::Redraw));
+        assert!(effects.contains(&Effect::WakeAfter { ms: 16 }));
+        assert_eq!(readout(&session).as_deref(), Some("Copied 1200 × 1600"));
+        session.wait(1300);
+        session.send(Input::Tick);
+        assert_eq!(readout(&session), None);
+        assert!(session.app.notice.is_none());
+
+        session.send(Input::CopyFailed {
+            error: Error::unexpected("the clipboard is busy"),
+        });
+        assert_eq!(readout(&session).as_deref(), Some(COPY_FAILED));
+        // A zoom replaces the notice, and a notice the zoom.
+        session.key(Key::Char('1'));
+        assert_eq!(readout(&session).as_deref(), Some("100%"));
+        session.send(Input::Copied { size });
+        assert_eq!(readout(&session).as_deref(), Some("Copied 1600 × 1200"));
+        assert!(session.app.zoom_changed.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_selected_mark() {
+        let mut session = Session::new();
+        session.open(&[r"C:\shots\one.png"]);
+        session.decode(1, 1600, 1200);
+        // At this zoom of 50%, the mark covers (200, 200) to (600, 400).
+        session.mark((100.0, 100.0), (300.0, 200.0), "here");
+        session.down(Button::Left, 200.0, 150.0);
+        session.up(Button::Left, 200.0, 150.0);
+        let size = PixelSize::new(1600, 1200);
+        assert_eq!(
+            copy(&mut session),
+            [(1, size, PixelRect::new(200, 200, 400, 200), Rotation::None)]
+        );
+        // With no mark selected, the whole image is copied.
+        session.key(Key::Escape);
+        assert_eq!(
+            copy(&mut session),
+            [(1, size, PixelRect::whole(size), Rotation::None)]
+        );
+
+        // A mark left partly outside the image by a smaller reload is cut to
+        // the image; one left wholly outside copies nothing.
+        session.down(Button::Left, 200.0, 150.0);
+        session.up(Button::Left, 200.0, 150.0);
+        session.send(Input::FileChanged { image: ImageId(1) });
+        session.decode(1, 400, 300);
+        assert_eq!(
+            copy(&mut session),
+            [(
+                1,
+                PixelSize::new(400, 300),
+                PixelRect::new(200, 200, 200, 100),
+                Rotation::None
+            )]
+        );
+        session.send(Input::FileChanged { image: ImageId(1) });
+        session.decode(1, 100, 100);
+        assert!(copy(&mut session).is_empty());
+        assert_eq!(readout(&session).as_deref(), Some(COPY_FAILED));
+    }
+
+    #[test]
+    fn a_copy_waits_for_the_full_decode() {
+        let mut session = Session::new();
+        session.open(&[r"C:\shots\one.png", r"C:\shots\two.png"]);
+        session.send(Input::Decoded {
+            image: ImageId(1),
+            target: DecodeTarget::Fit { within: WINDOW },
+            size: PixelSize::new(4000, 3000),
+        });
+        assert_eq!(session.list().images[0].state, LoadState::Preview);
+        assert!(copy(&mut session).is_empty());
+        let effects = session.decode(1, 4000, 3000);
+        let size = PixelSize::new(4000, 3000);
+        assert_eq!(
+            copies(&effects),
+            [(1, size, PixelRect::whole(size), Rotation::None)]
+        );
+        assert!(copies(&session.decode(1, 4000, 3000)).is_empty());
+
+        // Moving to another image drops a copy still waiting.
+        session.send(Input::FileChanged { image: ImageId(1) });
+        assert!(copy(&mut session).is_empty());
+        session.key(Key::Right);
+        session.key(Key::Left);
+        assert!(copies(&session.decode(1, 4000, 3000)).is_empty());
+
+        // So does a decode that fails.
+        session.send(Input::FileChanged { image: ImageId(1) });
+        assert!(copy(&mut session).is_empty());
+        session.send(Input::DecodeFailed {
+            image: ImageId(1),
+            error: Error::new(ErrorCode::DecodeFailed, "broken"),
+        });
+        assert!(session.app.copy.is_none());
+
+        // And closing the image.
+        session.key(Key::Right);
+        assert!(copy(&mut session).is_empty());
+        assert!(session.app.copy.is_some());
+        session.key_with(Key::Char('w'), Modifiers::CTRL);
+        assert!(session.app.copy.is_none());
+    }
+
+    #[test]
+    fn in_compare_view_ctrl_c_copies_the_selected_image() {
+        let mut session = Session::tall();
+        session.open_with(&[r"C:\before.png", r"C:\after.png"], Some("fix"), true);
+        session.decode(1, 1600, 1200);
+        session.decode(2, 800, 600);
+        session.key(Key::Right);
+        session.key(Key::Char('r'));
+        let size = PixelSize::new(800, 600);
+        let expected = [(2, size, PixelRect::whole(size), Rotation::Clockwise90)];
+        assert_eq!(copy(&mut session), expected);
+        session.key(Key::Char('s'));
+        assert_eq!(copy(&mut session), expected);
+    }
+
+    #[test]
+    fn ctrl_c_in_the_note_field_is_left_to_the_field() {
+        let mut session = Session::new();
+        session.open(&[r"C:\shots\one.png"]);
+        session.decode(1, 1600, 1200);
+        session.drag(Button::Right, (100.0, 100.0), (300.0, 200.0));
+        assert!(copy(&mut session).is_empty());
+        assert!(session.app.copy.is_none());
     }
 }
