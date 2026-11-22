@@ -30,9 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
     WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE,
-    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE,
+    WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -88,6 +89,9 @@ pub trait Handler {
     fn focus(&mut self) {}
     /// The system's light or dark setting may have changed.
     fn theme_changed(&mut self) {}
+    /// The window's frame is about to be drawn as active or in the
+    /// background.
+    fn activated(&mut self, _active: bool) {}
     /// Watched files have changed.
     fn files_changed(&mut self) {}
     /// The copier has a copy ready.
@@ -572,6 +576,12 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 }
                 WM_CLOSE => handler.input(Input::CloseWindow),
                 WM_SETTINGCHANGE if theme::is_theme_change(lparam) => handler.theme_changed(),
+                // The default handling then draws the frame, in the colours
+                // the handler gave it.
+                WM_NCACTIVATE => {
+                    handler.activated(wparam.0 != 0);
+                    return None;
+                }
                 WM_SETFOCUS => handler.focus(),
                 WM_DPICHANGED => handler.input(Input::Dpi {
                     dpi: (wparam.0 & 0xFFFF) as u32,
@@ -658,6 +668,9 @@ mod tests {
         }
         fn theme_changed(&mut self) {
             self.push("theme".into());
+        }
+        fn activated(&mut self, active: bool) {
+            self.push(format!("active {active}"));
         }
         fn copied(&mut self) {
             self.push("copied".into());
@@ -759,8 +772,20 @@ mod tests {
 
         window.set_handler(Box::new(Defaults));
         send(&window, WM_SETTINGCHANGE, 0, colour.as_ptr() as isize);
-        theme::set_title_bar(window.hwnd(), true);
-        theme::set_title_bar(window.hwnd(), false);
+        send(&window, WM_NCACTIVATE, 1, 0);
+        for (dark, active) in [(true, true), (true, false), (false, true), (false, false)] {
+            theme::set_frame(window.hwnd(), dark, active);
+        }
+    }
+
+    #[test]
+    fn activation_reaches_the_handler() {
+        let window = Window::create(PixelRect::new(10, 10, 320, 200), "test").unwrap();
+        let log = Rc::new(RefCell::new(Log::default()));
+        window.set_handler(Box::new(Recorder(Rc::clone(&log))));
+        send(&window, WM_NCACTIVATE, 1, 0);
+        send(&window, WM_NCACTIVATE, 0, 0);
+        assert_eq!(log.borrow().0, ["active true", "active false"]);
     }
 
     #[test]

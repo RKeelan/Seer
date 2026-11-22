@@ -14,11 +14,11 @@ const SEERW: &str = env!("CARGO_BIN_EXE_seerw");
 const SEER: &str = env!("CARGO_BIN_EXE_seer");
 
 /// The selected thumbnail's outline.
-const ACCENT: Rgba = Rgba::opaque(0, 103, 192);
+const ACCENT: Rgba = Rgba::opaque(0x8F, 0xC4, 0xA3);
 /// The strip's background in the dark theme.
-const STRIP: Rgba = Rgba::opaque(43, 43, 43);
+const STRIP: Rgba = Rgba::opaque(0x22, 0x1C, 0x19);
 /// The background above the strip in the dark theme.
-const BACKGROUND: Rgba = Rgba::opaque(32, 32, 32);
+const BACKGROUND: Rgba = Rgba::opaque(0x1A, 0x17, 0x14);
 
 /// The middle of each of the first three thumbnail boxes in a 256 × 276
 /// client area at 100% scale: the strip takes the bottom 84 rows, and its

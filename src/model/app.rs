@@ -611,10 +611,79 @@ pub const NOTE_PADDING: f64 = 6.0;
 /// The scene draws the field's box in them, and the window gives its text
 /// control the same, so the two look like one field.
 pub const fn note_colours(dark: bool) -> (Colour, Colour) {
-    if dark {
-        (DARK_FIELD, DARK_TEXT)
-    } else {
-        (WHITE, LIGHT_TEXT)
+    let colours = theme_colours(dark);
+    (colours.field, colours.text)
+}
+
+/// The colours that follow the light or dark theme.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThemeColours {
+    /// Behind the images.
+    pub background: Colour,
+    /// Text, on any of the fills.
+    pub text: Colour,
+    /// The title bar and the thumbnail strip.
+    pub panel: Colour,
+    /// The note field.
+    pub field: Colour,
+    /// The title while the window is in the background.
+    pub faint: Colour,
+    /// The line around the window.
+    pub line: Colour,
+    /// The outline of the selected image and of the note field.
+    pub accent: Colour,
+}
+
+/// The light theme: cream paper and dark brown ink, with a deep green
+/// accent.
+const LIGHT: ThemeColours = ThemeColours {
+    background: Colour::rgb(0xF2, 0xEB, 0xDC),
+    text: Colour::rgb(0x2A, 0x20, 0x1B),
+    panel: Colour::rgb(0xF9, 0xF5, 0xEC),
+    field: Colour::rgb(0xE9, 0xE0, 0xCC),
+    faint: Colour::rgb(0x7A, 0x6D, 0x61),
+    line: Colour::rgb(0xDC, 0xD0, 0xBB),
+    accent: Colour::rgb(0x1F, 0x5C, 0x3F),
+};
+
+/// The dark theme: warm black paper and cream ink, with a pale green accent.
+const DARK: ThemeColours = ThemeColours {
+    background: Colour::rgb(0x1A, 0x17, 0x14),
+    text: Colour::rgb(0xE4, 0xDA, 0xC6),
+    panel: Colour::rgb(0x22, 0x1C, 0x19),
+    field: Colour::rgb(0x26, 0x20, 0x1C),
+    faint: Colour::rgb(0x8E, 0x82, 0x73),
+    line: Colour::rgb(0x3A, 0x30, 0x2B),
+    accent: Colour::rgb(0x8F, 0xC4, 0xA3),
+};
+
+/// The dark theme's colours or the light's.
+pub const fn theme_colours(dark: bool) -> ThemeColours {
+    if dark { DARK } else { LIGHT }
+}
+
+/// The colours of the window's frame: its title bar, the title's text, and
+/// the line around the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameColours {
+    /// The title bar's fill.
+    pub caption: Colour,
+    /// The title's text.
+    pub text: Colour,
+    /// The line around the window.
+    pub border: Colour,
+}
+
+/// The window frame's colours in the dark theme or the light, while the
+/// window is active or in the background. The title bar takes the theme's
+/// panel colour, as the strip does, rather than the system's accent colour,
+/// and the title fades while the window is in the background.
+pub const fn frame_colours(dark: bool, active: bool) -> FrameColours {
+    let colours = theme_colours(dark);
+    FrameColours {
+        caption: colours.panel,
+        text: if active { colours.text } else { colours.faint },
+        border: colours.line,
     }
 }
 
@@ -638,14 +707,11 @@ const DRAG_THRESHOLD: f64 = 4.0;
 /// The zoom from which pixels are drawn as squares so they can be inspected.
 const NEAREST_FROM: f64 = 4.0;
 
-const DARK_BACKGROUND: Colour = Colour::rgb(32, 32, 32);
-const DARK_TEXT: Colour = Colour::rgb(230, 230, 230);
-const LIGHT_BACKGROUND: Colour = Colour::rgb(243, 243, 243);
-const LIGHT_TEXT: Colour = Colour::rgb(28, 28, 28);
-const DARK_STRIP: Colour = Colour::rgb(43, 43, 43);
-const LIGHT_STRIP: Colour = Colour::rgb(232, 232, 232);
-const DARK_FIELD: Colour = Colour::rgb(45, 45, 45);
-const ACCENT: Colour = Colour::rgb(0, 103, 192);
+/// The fill of the banner shown while an agent waits for marks, and the
+/// Done button's text: a deep green, the same in both themes.
+const CLOTH: Colour = Colour::rgb(0x1E, 0x4D, 0x36);
+/// The banner's text and the Done button's fill: cream, on [`CLOTH`].
+const ON_CLOTH: Colour = Colour::rgb(0xED, 0xE4, 0xCF);
 const WHITE: Colour = Colour::rgb(255, 255, 255);
 const BLACK: Colour = Colour::rgb(0, 0, 0);
 const MARK: Colour = Colour::rgb(255, 0, 0);
@@ -2470,11 +2536,8 @@ impl App {
     /// What to draw for the current state, as of the last input.
     pub fn scene(&self) -> Scene {
         let scale = self.scale();
-        let (background, text) = if self.dark {
-            (DARK_BACKGROUND, DARK_TEXT)
-        } else {
-            (LIGHT_BACKGROUND, LIGHT_TEXT)
-        };
+        let colours = theme_colours(self.dark);
+        let (background, text) = (colours.background, colours.text);
         let mut items = Vec::new();
         let area = self.area();
 
@@ -2506,7 +2569,7 @@ impl App {
                 };
                 items.push(Item::StrokeRect {
                     rect: tile,
-                    colour: ACCENT,
+                    colour: colours.accent,
                     width: 2.0 * scale,
                     dashed: false,
                 });
@@ -2568,9 +2631,9 @@ impl App {
 
         if let Some(layout) = self.strip_layout() {
             let palette = Palette {
-                background: if self.dark { DARK_STRIP } else { LIGHT_STRIP },
+                background: colours.panel,
                 text,
-                accent: ACCENT,
+                accent: colours.accent,
             };
             let thumbnail = |image| self.images[&image].thumbnail;
             strip_items(&layout, self.set.selected(), thumbnail, palette, &mut items);
@@ -2584,7 +2647,7 @@ impl App {
             });
             items.push(Item::StrokeRect {
                 rect: field,
-                colour: ACCENT,
+                colour: colours.accent,
                 width: scale,
                 dashed: false,
             });
@@ -2612,7 +2675,7 @@ impl App {
         if let (Some(banner), Some(done)) = (self.banner(), self.done_button()) {
             items.push(Item::FillRect {
                 rect: banner,
-                colour: ACCENT,
+                colour: CLOTH,
             });
             items.push(Item::Text {
                 text: WAITING_TITLE.to_string(),
@@ -2622,19 +2685,19 @@ impl App {
                     (done.x - 24.0 * scale).max(0.0),
                     banner.height,
                 ),
-                colour: WHITE,
+                colour: ON_CLOTH,
                 size: 14.0 * scale,
                 align: Align::Start,
                 bold: false,
             });
             items.push(Item::FillRect {
                 rect: done,
-                colour: WHITE,
+                colour: ON_CLOTH,
             });
             items.push(Item::Text {
                 text: "Done".to_string(),
                 rect: done,
-                colour: ACCENT,
+                colour: CLOTH,
                 size: 14.0 * scale,
                 align: Align::Centre,
                 bold: true,
@@ -3831,7 +3894,7 @@ mod session_tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::Decode { .. }))
         );
-        assert_eq!(session.app.scene().background, LIGHT_BACKGROUND);
+        assert_eq!(session.app.scene().background, LIGHT.background);
     }
 
     #[test]
@@ -3990,6 +4053,65 @@ mod session_tests {
         assert!(!session.app.dark());
         assert_eq!(fill(&session), Some(note_colours(false).0));
         assert_ne!(note_colours(true), note_colours(false));
+    }
+
+    #[test]
+    fn the_frame_takes_the_panel_and_fades_its_title_in_the_background() {
+        let mut session = three_images();
+        for dark in [true, false] {
+            session.send(Input::Theme { dark });
+            let scene = session.app.scene();
+            let colours = theme_colours(dark);
+            let active = frame_colours(dark, true);
+            let inactive = frame_colours(dark, false);
+            // The title bar is the panel colour, as the strip is, active or
+            // not, apart from the background, with a border apart from it.
+            assert_eq!(scene.background, colours.background);
+            assert_eq!(active.caption, colours.panel);
+            assert_eq!(inactive.caption, colours.panel);
+            assert_ne!(active.caption, scene.background);
+            assert!(scene.items.iter().any(
+                |item| matches!(item, Item::FillRect { colour, .. } if *colour == colours.panel)
+            ));
+            assert_eq!(active.border, inactive.border);
+            assert_ne!(active.border, active.caption);
+            // The title is in the viewer's text colour while active, and
+            // fades towards the bar while in the background.
+            assert_eq!(active.text, note_colours(dark).1);
+            let distance = |a: Colour, b: Colour| (a.r - b.r).abs();
+            assert!(
+                distance(inactive.text, active.caption) < distance(active.text, active.caption)
+            );
+        }
+        assert_ne!(frame_colours(true, true), frame_colours(false, true));
+    }
+
+    #[test]
+    fn text_and_outlines_stand_out_from_what_they_sit_on() {
+        // WCAG's contrast ratio between two colours.
+        fn contrast(a: Colour, b: Colour) -> f32 {
+            let channel = |c: f32| {
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let luminance =
+                |c: Colour| 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b);
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+        for dark in [true, false] {
+            let colours = theme_colours(dark);
+            for fill in [colours.background, colours.panel, colours.field] {
+                assert!(contrast(colours.text, fill) >= 7.0);
+                assert!(contrast(colours.accent, fill) >= 3.0);
+            }
+            assert!(contrast(colours.faint, colours.panel) >= 3.0);
+        }
+        assert!(contrast(ON_CLOTH, CLOTH) >= 7.0);
+        assert_ne!(theme_colours(true).accent, theme_colours(false).accent);
     }
 
     #[test]
@@ -4934,7 +5056,7 @@ mod session_tests {
                 .send(Input::Theme { dark: false })
                 .contains(&Effect::Redraw)
         );
-        assert_eq!(session.app.scene().background, LIGHT_BACKGROUND);
+        assert_eq!(session.app.scene().background, LIGHT.background);
         // The strip grows with the scale.
         assert!(
             session

@@ -16,7 +16,7 @@ const SEERW: &str = env!("CARGO_BIN_EXE_seerw");
 const SEER: &str = env!("CARGO_BIN_EXE_seer");
 
 /// The banner shown while an agent waits for marks.
-const BANNER: Rgba = Rgba::opaque(0, 103, 192);
+const BANNER: Rgba = Rgba::opaque(0x1E, 0x4D, 0x36);
 /// A mark's outline.
 const MARK: Rgba = Rgba::opaque(255, 0, 0);
 /// A selected mark's outline.
@@ -163,7 +163,7 @@ fn marks_are_reported_in_image_pixels_at_any_zoom_and_rotation() {
     // theme a headless viewer always has.
     let shot = screenshot(&viewer, &dir);
     assert!(
-        near(shot.get(100, 14), Rgba::opaque(45, 45, 45)),
+        near(shot.get(100, 14), Rgba::opaque(0x26, 0x20, 0x1C)),
         "{:?}",
         shot.get(100, 14)
     );
