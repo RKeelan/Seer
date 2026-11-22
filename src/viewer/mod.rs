@@ -1515,8 +1515,9 @@ mod tests {
     #[test]
     fn the_viewer_moves_to_the_hardware_device_without_a_blank_frame() {
         let dir = TempDir::new().unwrap();
-        let path = dir.join("image.png");
-        write_image(&path, &Pixels::solid(640, 480, Rgba::GREEN), Format::Png).unwrap();
+        // Large enough for the codec to halve it while decoding the preview.
+        let path = dir.join("image.jpg");
+        write_image(&path, &Pixels::solid(1280, 960, Rgba::GREEN), Format::Jpeg).unwrap();
         let window = Window::create(PixelRect::new(0, 0, 400, 300), "upgrade").unwrap();
         let hwnd = Arc::new(AtomicIsize::new(window.hwnd().0 as isize));
         let (_events, received) = mpsc::channel();
@@ -1547,7 +1548,7 @@ mod tests {
         // The app asks for the full decode once the preview is shown.
         let output = next_output(&viewer.worker);
         viewer.accept(output);
-        assert_eq!(viewer.bitmap_sizes[&image], PixelSize::new(640, 480));
+        assert_eq!(viewer.bitmap_sizes[&image], PixelSize::new(1280, 960));
         viewer.resize(PixelSize::new(200, 100));
         viewer.resize(PixelSize::new(0, 0));
         assert_eq!(viewer.graphics.swap_chain.size(), PixelSize::new(200, 100));
@@ -1564,7 +1565,7 @@ mod tests {
         viewer.decoded();
         viewer.device_ready();
         viewer.requests();
-        assert!(window::title(window.hwnd()).starts_with("image.png — 640 × 480"));
+        assert!(window::title(window.hwnd()).starts_with("image.jpg — 1280 × 960"));
         // Closing the image drops its bitmap.
         viewer.input(key(Key::Delete));
         assert!(viewer.bitmaps.is_empty());
