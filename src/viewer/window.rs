@@ -28,11 +28,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     KillTimer, LoadCursorW, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE,
-    WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCACTIVATE, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
     WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
@@ -456,6 +456,11 @@ fn input_for(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Vec<In
             .map(|key| Input::Key { key, modifiers })
             .into_iter()
             .collect(),
+        // `?` is on a different key in each layout, so it is read as typed.
+        (WM_CHAR, _) if wparam.0 == usize::from(b'?') => vec![Input::Key {
+            key: Key::Char('?'),
+            modifiers,
+        }],
         (WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN, Some(button)) => {
             // SAFETY: SetCapture checks the handle.
             unsafe { SetCapture(hwnd) };
@@ -605,9 +610,9 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     unsafe { SetCursor(LoadCursorW(None, cursor).ok()) };
                     return Some(LRESULT(1));
                 }
-                WM_KEYDOWN | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
-                | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP
-                | WM_MBUTTONDBLCLK | WM_MOUSEMOVE | WM_MOUSEWHEEL => {
+                WM_KEYDOWN | WM_CHAR | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK
+                | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN
+                | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_MOUSEMOVE | WM_MOUSEWHEEL => {
                     let inputs = input_for(hwnd, message, wparam, lparam);
                     if inputs.is_empty() {
                         return None;
@@ -847,6 +852,9 @@ mod tests {
         window.set_handler(Box::new(Recorder(Rc::clone(&log))));
         send(&window, WM_KEYDOWN, usize::from(VK_RIGHT.0), 0);
         send(&window, WM_KEYDOWN, usize::from(VK_CONTROL.0), 0);
+        // Of the characters typed, only `?` is a key.
+        send(&window, WM_CHAR, usize::from(b'?'), 0);
+        send(&window, WM_CHAR, usize::from(b'r'), 0);
         let at = (20 << 16) | 30;
         send(&window, WM_RBUTTONDOWN, 0, at);
         send(&window, WM_MOUSEMOVE, 0, at);
@@ -858,6 +866,7 @@ mod tests {
         let log = log.borrow();
         let expected = [
             r#"{"type":"key","key":"right"}"#,
+            r#"{"type":"key","key":"?"}"#,
             r#"{"type":"pointer_down","button":"right","at":{"x":30.0,"y":20.0}}"#,
             r#"{"type":"pointer_move","at":{"x":30.0,"y":20.0}}"#,
             r#"{"type":"pointer_up","button":"right","at":{"x":30.0,"y":20.0}}"#,
