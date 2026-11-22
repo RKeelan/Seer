@@ -16,7 +16,8 @@
 //! With `--open` it measures an open into a running viewer: the time from
 //! just before a `seer open <file>` process starts to the viewer's first
 //! `Present` of that image. It starts one viewer, then opens a different copy
-//! of the JPEG on each run, so every open decodes afresh. The viewer records
+//! of the JPEG on each run, so every open decodes afresh, pausing before each
+//! so the viewer has finished drawing the one before. The viewer records
 //! when it handled the request and presented the image; the benchmark places
 //! the moment it started `seer` on the viewer's timeline with
 //! [`process_age_ms`]. The report gives each run's time, the median and worst,
@@ -45,6 +46,12 @@ use seer::viewer::timing::process_age_ms;
 
 const WIDTH: u32 = 4000;
 const HEIGHT: u32 = 3000;
+
+/// How long `--open` waits before each open, for the viewer to finish
+/// drawing the image before. WARP draws on threads of its own after
+/// `Present` returns, taking about 50 ms to scale this image to a large
+/// window, and a decode that overlaps that work runs about a quarter slower.
+const SETTLE: Duration = Duration::from_millis(100);
 
 fn main() -> ExitCode {
     match run() {
@@ -178,6 +185,7 @@ fn open_latency(
     let mut handled = Vec::new();
     let mut decoded = Vec::new();
     for run in 1..=runs {
+        std::thread::sleep(SETTLE);
         let file = dir.join(format!("open-{run}.jpg"));
         std::fs::copy(image, &file).map_err(|error| error.to_string())?;
         let started = viewer.age_ms()?;
