@@ -4,10 +4,11 @@
 //! it, on the hardware or on WARP, the software rasteriser, which is what
 //! machines without a GPU (such as CI runners) have.
 //!
-//! Creating a hardware device loads the graphics driver, which can take well
-//! over 100 ms, while a WARP device takes a few. So the viewer draws its first
-//! frame on WARP while [`hardware_device`] runs on another thread, then moves
-//! to the hardware. A [`SwapChain`] is a flip-model swap chain made for
+//! Creating a hardware device loads the graphics driver, which can take most
+//! of the cold-start budget, while a WARP device is quick to make. So the
+//! viewer draws its first frame on WARP while [`hardware_device`] runs on
+//! another thread, then moves to the hardware. A [`SwapChain`] is a
+//! flip-model swap chain made for
 //! composition, and a [`Composition`] shows one in a window; switching the
 //! window from one swap chain to another is a single atomic commit, so the
 //! move between devices never shows an empty frame.
