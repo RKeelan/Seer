@@ -18,7 +18,7 @@ const SEERW: &str = env!("CARGO_BIN_EXE_seerw");
 const SEER: &str = env!("CARGO_BIN_EXE_seer");
 
 /// The background behind the image, in the dark theme.
-const BACKGROUND: Rgba = Rgba::opaque(32, 32, 32);
+const BACKGROUND: Rgba = Rgba::opaque(0x1A, 0x17, 0x14);
 
 fn viewer(files: &[&Path]) -> HeadlessViewer {
     HeadlessViewer::start(Path::new(SEERW), Path::new(SEER), files).expect("the viewer starts")

@@ -11,7 +11,7 @@ const SEERW: &str = env!("CARGO_BIN_EXE_seerw");
 const SEER: &str = env!("CARGO_BIN_EXE_seer");
 
 /// The selected tile's outline.
-const ACCENT: Rgba = Rgba::opaque(0, 103, 192);
+const ACCENT: Rgba = Rgba::opaque(0x8F, 0xC4, 0xA3);
 
 /// A rectangle of client pixels: left and top inclusive, right and bottom
 /// exclusive.
@@ -114,13 +114,13 @@ fn extent(shot: &Pixels, within: Region, colour: Rgba) -> Option<Region> {
     found
 }
 
-/// Whether text is drawn within `within`: the theme's light text on the dark
-/// background leaves bright grey pixels.
+/// Whether text is drawn within `within`: the theme's cream text on the dark
+/// background leaves bright, slightly warm pixels.
 fn has_text(shot: &Pixels, within: Region) -> bool {
     (within.top..within.bottom).any(|y| {
         (within.left..within.right).any(|x| {
             let Rgba { r, g, b, .. } = shot.get(x, y);
-            r > 150 && r.abs_diff(g) < 16 && r.abs_diff(b) < 16
+            r > 150 && r.abs_diff(g) < 24 && r.abs_diff(b) < 48
         })
     })
 }

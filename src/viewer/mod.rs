@@ -245,7 +245,8 @@ fn start(args: &RunArgs) -> Result<u8> {
     }
 
     let window = Window::create(placement, &app.title())?;
-    theme::set_title_bar(window.hwnd(), dark);
+    // The window is in the background until it is shown and activated.
+    theme::set_frame(window.hwnd(), dark, false);
     hwnd.store(window.hwnd().0 as isize, Ordering::Release);
     timings.mark("window_created");
     let composition = Composition::new(window.hwnd())?;
@@ -593,6 +594,8 @@ struct Viewer {
     copier: Copier,
     /// Saves pasted images off the UI thread.
     paster: Paster,
+    /// Whether the window is active, which its frame shows.
+    active: bool,
 }
 
 impl Viewer {
@@ -639,6 +642,7 @@ impl Viewer {
                 window::post(posted_to, WM_COPIED)
             }),
             paster: Paster::new(move || window::post(posted_to, WM_PASTED)),
+            active: false,
         }
     }
 
@@ -1419,11 +1423,16 @@ impl Handler for Viewer {
             return;
         }
         let dark = theme::apps_dark();
-        theme::set_title_bar(self.hwnd, dark);
+        theme::set_frame(self.hwnd, dark, self.active);
         if let Some(note) = &mut self.note {
             note.set_dark(dark);
         }
         self.input(Input::Theme { dark });
+    }
+
+    fn activated(&mut self, active: bool) {
+        self.active = active;
+        theme::set_frame(self.hwnd, self.app.dark(), active);
     }
 
     fn control_colours(&mut self, hdc: HDC, control: HWND) -> Option<HBRUSH> {
@@ -2064,6 +2073,11 @@ mod tests {
         let light = viewer.app.scene().background;
         viewer.theme_changed();
         assert_eq!(viewer.app.scene().background, light);
+        // The frame follows the window's activation.
+        viewer.activated(true);
+        assert!(viewer.active);
+        viewer.activated(false);
+        assert!(!viewer.active);
 
         viewer.visibility = Visibility::Hidden {
             activate: false,

@@ -329,8 +329,9 @@ fn create_edit(parent: HWND, layered: bool) -> Result<HWND> {
     Ok(hwnd)
 }
 
-/// A colour as GDI takes it: red in the low byte, then green, then blue.
-fn colorref(colour: Colour) -> COLORREF {
+/// A colour as GDI and DWM take it: red in the low byte, then green, then
+/// blue.
+pub fn colorref(colour: Colour) -> COLORREF {
     let byte = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u32;
     COLORREF(byte(colour.r) | (byte(colour.g) << 8) | (byte(colour.b) << 16))
 }
@@ -489,7 +490,8 @@ mod tests {
         let (fill, ink) = note_colours(false);
         let (background, text, _) = colours(&field);
         assert_eq!((background, text), (colorref(fill), colorref(ink)));
-        assert_eq!(background, COLORREF(0x00FF_FFFF));
+        // Red in the low byte: the light field is 0xE9E0CC.
+        assert_eq!(background, COLORREF(0x00CC_E0E9));
         // SAFETY: the device context was made above and is not used again.
         let _ = unsafe { DeleteDC(hdc) };
     }
