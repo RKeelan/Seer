@@ -14,6 +14,8 @@ env:
 jobs:
   release:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     defaults:
       run:
         shell: pwsh
@@ -46,3 +48,35 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create $env:GITHUB_REF_NAME $env:ZIP --title "Seer ${{ steps.version.outputs.version }}" --generate-notes --verify-tag
+
+  # Opens a pull request to microsoft/winget-pkgs that adds the release, using
+  # the previous version's manifests there as the template. It does nothing
+  # until the WINGET_TOKEN secret is set (see README.md's "Releasing").
+  winget:
+    needs: release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Submit the release to winget
+        if: env.WINGET_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # komac reads its token from GITHUB_TOKEN.
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          KOMAC_VERSION: 2.17.2
+          KOMAC_SHA256: 38a5a53b2291e959157a46a9ed2f20c1c66e9e238666780519650fcc8d37ad58
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $komac = "komac-$env:KOMAC_VERSION-x86_64-pc-windows-msvc.exe"
+          gh release download "v$env:KOMAC_VERSION" --repo russellbanks/Komac --pattern $komac
+          if ((Get-FileHash $komac -Algorithm SHA256).Hash -ne $env:KOMAC_SHA256) {
+            Write-Error "$komac does not have the expected SHA-256."
+            exit 1
+          }
+          $releases = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases"
+          $url = "$releases/download/$env:GITHUB_REF_NAME/seer-$env:VERSION-x86_64-windows.zip"
+          & "./$komac" update RKeelan.Seer --version $env:VERSION --urls $url --release-notes-url "$releases/tag/$env:GITHUB_REF_NAME" --submit

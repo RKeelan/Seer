@@ -19,6 +19,13 @@
 //! `Software\RegisteredApplications` entry pointing to it. It never makes
 //! Seer the default for any type: Windows asks the user to choose.
 //!
+//! Last, it adds an uninstall entry,
+//! `Software\Microsoft\Windows\CurrentVersion\Uninstall\RKeelan.Seer`, so Seer
+//! appears in Settings > Apps > Installed apps, which runs `seer uninstall` to
+//! remove it. The entry is also how winget, which installs Seer by running
+//! `seer install` from the release zip, recognises it as installed and reads
+//! its version.
+//!
 //! Uninstalling removes all of it, leaving other programs' entries under the
 //! same extensions alone.
 //!
@@ -50,6 +57,13 @@ pub const VIEWER: &str = "seerw.exe";
 
 /// The name Seer registers itself under.
 const APPLICATION: &str = "Seer";
+
+/// The name of Seer's uninstall entry, which is also its winget package
+/// identifier and the `ProductCode` its winget manifest names.
+pub const PACKAGE: &str = "RKeelan.Seer";
+
+/// The publisher the uninstall entry names, as the winget manifest does.
+const PUBLISHER: &str = "RKeelan";
 
 /// A family of formats that shares one ProgID.
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +187,13 @@ impl Target {
         format!(r"{}\RegisteredApplications", self.software)
     }
 
+    fn uninstall_entry(&self) -> String {
+        format!(
+            r"{}\Microsoft\Windows\CurrentVersion\Uninstall\{PACKAGE}",
+            self.software
+        )
+    }
+
     fn viewer(&self) -> PathBuf {
         self.directory.join(VIEWER)
     }
@@ -205,6 +226,7 @@ pub fn install(target: &Target, source: &Path) -> Result<Installed> {
     copy_executables(source, target)?;
     register(target)?;
     let path_added = edit_path(target, |path| path_with(path, &target.directory))?;
+    add_uninstall_entry(target)?;
     Ok(Installed {
         directory: target.directory.clone(),
         path_added,
@@ -364,8 +386,40 @@ fn register(target: &Target) -> Result<()> {
     Ok(())
 }
 
+/// Adds the entry Settings > Apps and winget read. It is added last, so that
+/// an installation that failed part way does not look finished.
+fn add_uninstall_entry(target: &Target) -> Result<()> {
+    let seer = target.directory.join(EXECUTABLES[0]);
+    let uninstall = Value::String(format!("\"{}\" uninstall", seer.display()));
+    let entry = Key::create(&target.uninstall_entry())?;
+    entry.set("DisplayName", &Value::String(APPLICATION.into()))?;
+    entry.set(
+        "DisplayVersion",
+        &Value::String(env!("CARGO_PKG_VERSION").into()),
+    )?;
+    entry.set("Publisher", &Value::String(PUBLISHER.into()))?;
+    entry.set(
+        "DisplayIcon",
+        &Value::String(format!("{},0", target.viewer().display())),
+    )?;
+    entry.set(
+        "InstallLocation",
+        &Value::String(target.directory.display().to_string()),
+    )?;
+    entry.set(
+        "URLInfoAbout",
+        &Value::String(env!("CARGO_PKG_REPOSITORY").into()),
+    )?;
+    entry.set("UninstallString", &uninstall)?;
+    entry.set("QuietUninstallString", &uninstall)?;
+    Ok(())
+}
+
 fn unregister(target: &Target) -> Result<()> {
     let software = &target.software;
+    let entry = target.uninstall_entry();
+    registry::delete_tree(&entry)?;
+    registry::delete_empty(&entry, software)?;
     let classes = target.classes();
     for family in FAMILIES {
         registry::delete_tree(&format!(r"{classes}\{}", family.prog_id))?;
@@ -608,6 +662,33 @@ mod tests {
             r"Software\RegisteredApplications : Seer = {:?}",
             format!(r"{root}\Software\Seer\Capabilities")
         ));
+        let mut key = "Software".to_owned();
+        for part in ["Microsoft", "Windows", "CurrentVersion", "Uninstall"] {
+            key = format!(r"{key}\{part}");
+            lines.push(key.clone());
+        }
+        let entry = format!(r"{key}\RKeelan.Seer");
+        lines.push(entry.clone());
+        let seer = directory.join("seer.exe").display().to_string();
+        let uninstall = format!("{:?}", format!("\"{seer}\" uninstall"));
+        for (name, value) in [
+            ("DisplayName", r#""Seer""#.to_owned()),
+            ("DisplayVersion", format!("{:?}", env!("CARGO_PKG_VERSION"))),
+            ("Publisher", r#""RKeelan""#.to_owned()),
+            ("DisplayIcon", icon.clone()),
+            (
+                "InstallLocation",
+                format!("{:?}", directory.display().to_string()),
+            ),
+            (
+                "URLInfoAbout",
+                r#""https://github.com/RKeelan/Seer""#.to_owned(),
+            ),
+            ("UninstallString", uninstall.clone()),
+            ("QuietUninstallString", uninstall),
+        ] {
+            lines.push(format!("{entry} : {name} = {value}"));
+        }
         lines.sort();
         lines
     }
