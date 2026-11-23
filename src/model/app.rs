@@ -693,7 +693,7 @@ pub const fn frame_colours(dark: bool, active: bool) -> FrameColours {
 pub const SHORTCUTS_TITLE: &str = "Keyboard shortcuts";
 
 /// The list of shortcuts that `?` and F1 show: the keys, and what they do.
-pub const SHORTCUTS: [(&str, &str); 16] = [
+pub const SHORTCUTS: [(&str, &str); 18] = [
     ("← → ↑ ↓, Page Up, Page Down", "Previous or next image"),
     ("Home, End", "First or last image"),
     ("Wheel, pinch, + −", "Zoom"),
@@ -710,7 +710,9 @@ pub const SHORTCUTS: [(&str, &str); 16] = [
     ("Right-drag, M", "Draw a mark, or toggle mark mode"),
     ("F2", "Edit the selected mark's note"),
     ("Ctrl+Enter", "Finish marking"),
-    ("C", "Compare view"),
+    ("Shift+click, Ctrl+click", "Pick thumbnails in the strip"),
+    ("G", "Put the picked images in a new group"),
+    ("C", "Compare the image's group"),
     ("S", "Switch between compare and split view"),
     ("?, F1", "Show or hide this list"),
 ];
@@ -723,6 +725,8 @@ const READOUT_HOLD: Duration = Duration::from_millis(1000);
 const READOUT_FADE_OUT: Duration = Duration::from_millis(300);
 /// What the readout says when a copy could not be made.
 pub const COPY_FAILED: &str = "Could not copy";
+/// What the readout says when `C` is pressed on an image in no group.
+pub const NOT_IN_A_GROUP: &str = "Not in a group: select thumbnails and press G";
 /// What the readout says when Ctrl+V finds no image on the clipboard.
 pub const NOTHING_TO_PASTE: &str = "No image to paste";
 /// What the readout says when a paste could not be made.
@@ -784,6 +788,9 @@ pub struct App {
     mark_mode: bool,
     /// Whether the list of shortcuts is shown.
     shortcuts: bool,
+    /// The thumbnails picked in the strip with Shift or Ctrl, for `G` to
+    /// put in a new group.
+    picked: Vec<ImageId>,
     selected_mark: Option<MarkId>,
     note: Option<Note>,
     gesture: Gesture,
@@ -961,6 +968,7 @@ impl App {
             compare: None,
             mark_mode: false,
             shortcuts: false,
+            picked: Vec::new(),
             selected_mark: None,
             note: None,
             gesture: Gesture::Idle,
@@ -1028,7 +1036,11 @@ impl App {
     fn apply(&mut self, input: Input, effects: &mut Vec<Effect>) {
         match input {
             Input::Key { key, modifiers } => self.key(key, modifiers, effects),
-            Input::PointerDown { button, at, .. } => self.pointer_down(button, at, effects),
+            Input::PointerDown {
+                button,
+                at,
+                modifiers,
+            } => self.pointer_down(button, at, modifiers, effects),
             Input::PointerMove { at, .. } => self.pointer_move(at),
             Input::PointerUp { button, at, .. } => self.pointer_up(button, at),
             Input::DoubleClick { button, at, .. } => self.double_click(button, at),
@@ -1255,6 +1267,7 @@ impl App {
                 }
             }
             Key::Char('c') => self.toggle_compare(),
+            Key::Char('g') => self.group_picked(),
             Key::Char('s') => {
                 if let Some(compare) = &mut self.compare {
                     compare.layout = match compare.layout {
@@ -1283,6 +1296,8 @@ impl App {
     fn escape(&mut self) {
         if let Gesture::Draw { .. } = self.gesture {
             self.gesture = Gesture::Idle;
+        } else if !self.picked.is_empty() {
+            self.picked.clear();
         } else if self.mark_mode {
             self.mark_mode = false;
         } else {
@@ -1400,8 +1415,50 @@ impl App {
                     *self.view_mut(image) = compare.view;
                 }
             }
-            None => self.start_compare(),
+            None => {
+                self.start_compare();
+                if self.compare.is_none() && self.set.selected().is_some() {
+                    self.notify(NOT_IN_A_GROUP.to_string());
+                }
+            }
         }
+    }
+
+    /// A click on a thumbnail in the strip. Shift picks the thumbnails from
+    /// the shown image's to this one, and Ctrl picks this one or drops it,
+    /// both leaving the shown image as it is; a plain click shows the image
+    /// and drops the picks.
+    fn click_thumbnail(&mut self, image: ImageId, modifiers: Modifiers) {
+        if modifiers.shift {
+            let order: Vec<ImageId> = self.set.iter().map(|entry| entry.id).collect();
+            let index = |id| order.iter().position(|&other| other == id);
+            let (Some(to), Some(from)) = (index(image), self.set.selected().and_then(index)) else {
+                return;
+            };
+            self.picked = order[from.min(to)..=from.max(to)].to_vec();
+        } else if modifiers.ctrl {
+            match self.picked.iter().position(|&id| id == image) {
+                Some(index) => {
+                    self.picked.remove(index);
+                }
+                None => self.picked.push(image),
+            }
+        } else {
+            self.picked.clear();
+            self.navigate(|set| {
+                set.select(image);
+            });
+        }
+    }
+
+    /// Puts the picked images, or the shown one if none are picked, into a
+    /// new group.
+    fn group_picked(&mut self) {
+        let ids = match self.picked.is_empty() {
+            true => self.set.selected().into_iter().collect(),
+            false => std::mem::take(&mut self.picked),
+        };
+        self.set.make_group(&ids);
     }
 
     fn start_compare(&mut self) {
@@ -1421,7 +1478,13 @@ impl App {
 
     // The pointer.
 
-    fn pointer_down(&mut self, button: Button, at: Point, effects: &mut Vec<Effect>) {
+    fn pointer_down(
+        &mut self,
+        button: Button,
+        at: Point,
+        modifiers: Modifiers,
+        effects: &mut Vec<Effect>,
+    ) {
         self.pointer = Some(at);
         if self.gesture != Gesture::Idle {
             return;
@@ -1440,9 +1503,7 @@ impl App {
                 return;
             }
             if let Some(image) = self.strip_layout().and_then(|layout| layout.image_at(at)) {
-                self.navigate(|set| {
-                    set.select(image);
-                });
+                self.click_thumbnail(image, modifiers);
                 return;
             }
             if self.near_divider(at) {
@@ -2071,6 +2132,7 @@ impl App {
     /// strip to a newly selected image, and asks for the thumbnails the strip
     /// shows.
     fn tidy(&mut self, effects: &mut Vec<Effect>) {
+        self.picked.retain(|&id| self.set.get(id).is_some());
         if let Some(compare) = &self.compare {
             let group = self.set.selected_entry().and_then(|e| e.group.as_ref());
             if group != Some(&compare.group) {
@@ -2680,7 +2742,14 @@ impl App {
                 accent: colours.accent,
             };
             let thumbnail = |image| self.images[&image].thumbnail;
-            strip_items(&layout, self.set.selected(), thumbnail, palette, &mut items);
+            strip_items(
+                &layout,
+                self.set.selected(),
+                &self.picked,
+                thumbnail,
+                palette,
+                &mut items,
+            );
         }
 
         if let (Some(field), Some(note)) = (self.note_field(), &self.note) {
@@ -4703,6 +4772,101 @@ mod session_tests {
         session.down(Button::Left, 400.0, 300.0);
         assert!(!shown(&session));
         assert_eq!(session.app.gesture, Gesture::Idle);
+    }
+
+    #[test]
+    fn thumbnails_picked_in_the_strip_become_a_group_to_compare() {
+        let mut session = Session::tall();
+        session.open(&[
+            r"C:\shots\one.png",
+            r"C:\shots\two.png",
+            r"C:\shots\three.png",
+            r"C:\shots\four.png",
+        ]);
+        let click = |session: &mut Session, image: u32, modifiers: Modifiers| {
+            let layout = session.app.strip_layout().expect("a strip");
+            let cell = layout.cells.iter().find(|c| c.image == ImageId(image));
+            let rect = cell.expect("a thumbnail").rect;
+            session.send(Input::PointerDown {
+                button: Button::Left,
+                at: Point::new(rect.x + 4.0, rect.y + 4.0),
+                modifiers,
+            });
+            session.send(Input::PointerUp {
+                button: Button::Left,
+                at: Point::new(rect.x + 4.0, rect.y + 4.0),
+                modifiers,
+            });
+        };
+        let groups = |session: &Session| {
+            session
+                .app
+                .set()
+                .iter()
+                .map(|entry| (entry.id.0, entry.group.clone()))
+                .collect::<Vec<_>>()
+        };
+        let group = |name: &str| Some(name.to_string());
+
+        // C outside a group says how to make one.
+        session.key(Key::Char('c'));
+        assert!(session.app.compare.is_none());
+        assert!(texts(&session.app.scene()).contains(&NOT_IN_A_GROUP.to_string()));
+
+        // Shift picks from the shown image to the one clicked, and Ctrl
+        // drops one; neither changes the shown image.
+        click(&mut session, 3, Modifiers::SHIFT);
+        assert_eq!(session.app.picked, [ImageId(1), ImageId(2), ImageId(3)]);
+        click(&mut session, 2, Modifiers::CTRL);
+        assert_eq!(session.app.picked, [ImageId(1), ImageId(3)]);
+        assert_eq!(session.app.set().selected(), Some(ImageId(1)));
+
+        session.key(Key::Char('g'));
+        assert!(session.app.picked.is_empty());
+        assert_eq!(
+            groups(&session),
+            [
+                (1, group("Group 1")),
+                (3, group("Group 1")),
+                (2, None),
+                (4, None)
+            ]
+        );
+        session.key(Key::Char('c'));
+        assert_eq!(session.app.compare.as_ref().unwrap().group, "Group 1");
+        session.key(Key::Char('c'));
+
+        // Ctrl picks one at a time, and a plain click drops the picks and
+        // shows the image.
+        click(&mut session, 4, Modifiers::CTRL);
+        assert_eq!(session.app.picked, [ImageId(4)]);
+        click(&mut session, 2, Modifiers::NONE);
+        assert!(session.app.picked.is_empty());
+        assert_eq!(session.app.set().selected(), Some(ImageId(2)));
+        // So does Escape, before anything else it does.
+        click(&mut session, 4, Modifiers::CTRL);
+        session.key(Key::Char('m'));
+        session.key(Key::Escape);
+        assert!(session.app.picked.is_empty());
+        assert!(session.app.mark_mode());
+        session.key(Key::Escape);
+
+        // With nothing picked, G puts the shown image in a group of its own.
+        session.key(Key::Char('g'));
+        assert_eq!(groups(&session)[2], (2, group("Group 2")));
+
+        // A picked image that is closed is no longer picked.
+        click(&mut session, 4, Modifiers::CTRL);
+        let layout = session.app.strip_layout().unwrap();
+        assert!(session.app.scene().items.iter().any(|item| matches!(
+            item,
+            Item::StrokeRect { rect, dashed: true, .. }
+                if rect.x < layout.cells[3].rect.x
+                    && rect.right() > layout.cells[3].rect.right()
+        )));
+        session.key(Key::Right);
+        session.key(Key::Delete);
+        assert!(session.app.picked.is_empty());
     }
 
     #[test]
