@@ -22,9 +22,12 @@ pub struct Palette {
 
 /// Adds the strip's items to `items`. `thumbnail` gives the full size of each
 /// image whose thumbnail has been decoded, which sets the thumbnail's shape.
+/// The shown image's thumbnail is outlined, and each picked one tinted and
+/// outlined with a dashed line.
 pub fn items(
     layout: &Layout,
     selected: Option<ImageId>,
+    picked: &[ImageId],
     thumbnail: impl Fn(ImageId) -> Option<PixelSize>,
     palette: Palette,
     items: &mut Vec<Item>,
@@ -72,7 +75,15 @@ pub fn items(
                 colour: palette.text.with_alpha(0.08),
             }),
         }
-        if Some(cell.image) == selected {
+        let shown = Some(cell.image) == selected;
+        let picked = picked.contains(&cell.image);
+        if picked {
+            items.push(Item::FillRect {
+                rect: cell.rect,
+                colour: palette.accent.with_alpha(0.35),
+            });
+        }
+        if shown || picked {
             let inset = 2.0 * scale;
             items.push(Item::StrokeRect {
                 rect: Rect::new(
@@ -83,7 +94,7 @@ pub fn items(
                 ),
                 colour: palette.accent,
                 width: 2.0 * scale,
-                dashed: false,
+                dashed: !shown,
             });
         }
     }
@@ -134,7 +145,14 @@ mod tests {
             2 => Some(PixelSize::new(16, 16)),
             _ => None,
         };
-        items(&layout, Some(ImageId(2)), sizes, PALETTE, &mut drawn);
+        items(
+            &layout,
+            Some(ImageId(2)),
+            &[ImageId(1)],
+            sizes,
+            PALETTE,
+            &mut drawn,
+        );
         let thumbnails: Vec<_> = drawn
             .iter()
             .filter_map(|item| match item {
@@ -159,6 +177,17 @@ mod tests {
             colour: PALETTE.accent,
             width: 2.0,
             dashed: false,
+        }));
+        // The picked one is tinted and outlined with a dashed line.
+        assert!(drawn.contains(&Item::FillRect {
+            rect: layout.cells[0].rect,
+            colour: PALETTE.accent.with_alpha(0.35),
+        }));
+        assert!(drawn.contains(&Item::StrokeRect {
+            rect: Rect::new(6.0, 122.0, 68.0, 52.0),
+            colour: PALETTE.accent,
+            width: 2.0,
+            dashed: true,
         }));
         assert!(drawn.iter().any(|item| matches!(
             item,

@@ -342,6 +342,41 @@ impl OpenSet {
             .collect()
     }
 
+    /// Puts the images in `ids` that are in the set into a new group, named
+    /// "Group 1", "Group 2" and so on, whichever is the first not taken, and
+    /// returns its name, or `None` if none of them are in the set. They leave
+    /// any group they were in and keep their order, gathered where the first
+    /// of them was, or just after the group there if that would split it.
+    pub fn make_group(&mut self, ids: &[ImageId]) -> Option<String> {
+        let first = self
+            .entries
+            .iter()
+            .position(|entry| ids.contains(&entry.id))?;
+        let name = (1..)
+            .map(|n| format!("Group {n}"))
+            .find(|name| self.iter().all(|e| e.group.as_ref() != Some(name)))
+            .expect("some number is free");
+        let (members, rest): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut self.entries)
+            .into_iter()
+            .partition(|entry| ids.contains(&entry.id));
+        self.entries = rest;
+        let mut at = first.min(self.entries.len());
+        // Between two members of a group, go after the group instead.
+        while at > 0
+            && at < self.entries.len()
+            && self.entries[at].group.is_some()
+            && self.entries[at].group == self.entries[at - 1].group
+        {
+            at += 1;
+        }
+        let members = members.into_iter().map(|entry| Entry {
+            group: Some(name.clone()),
+            ..entry
+        });
+        self.entries.splice(at..at, members);
+        Some(name)
+    }
+
     /// The images, in order.
     pub fn iter(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter()
@@ -541,6 +576,40 @@ mod tests {
         // The same group again changes nothing.
         add(&mut set, r"C:\1.png", Some("g"));
         assert_eq!(order(&set), [1, 3, 4, 2]);
+    }
+
+    #[test]
+    fn a_new_group_gathers_its_images_without_splitting_another() {
+        let mut set = OpenSet::new();
+        add(&mut set, r"C:\1.png", None);
+        add(&mut set, r"C:\2.png", Some("g"));
+        add(&mut set, r"C:\3.png", Some("g"));
+        add(&mut set, r"C:\4.png", Some("g"));
+        add(&mut set, r"C:\5.png", None);
+        add(&mut set, r"C:\6.png", None);
+        assert_eq!(set.make_group(&[]), None);
+        assert_eq!(set.make_group(&[ImageId(9)]), None);
+
+        // Gathered where the first was, in set order.
+        let ids = [ImageId(6), ImageId(1), ImageId(5)];
+        assert_eq!(set.make_group(&ids).as_deref(), Some("Group 1"));
+        assert_eq!(order(&set), [1, 5, 6, 2, 3, 4]);
+        assert_eq!(set.group("Group 1"), [ImageId(1), ImageId(5), ImageId(6)]);
+
+        // 3 was in the middle of g, so its new group goes after g rather
+        // than splitting it, and takes the first name free.
+        assert_eq!(set.make_group(&[ImageId(3)]).as_deref(), Some("Group 2"));
+        assert_eq!(order(&set), [1, 5, 6, 2, 4, 3]);
+        assert_eq!(set.group("g"), [ImageId(2), ImageId(4)]);
+
+        // A name freed is used again.
+        assert_eq!(
+            set.make_group(&[ImageId(1), ImageId(5), ImageId(6)])
+                .as_deref(),
+            Some("Group 3")
+        );
+        assert_eq!(set.group("Group 1"), []);
+        assert_eq!(set.make_group(&[ImageId(2)]).as_deref(), Some("Group 1"));
     }
 
     #[test]
