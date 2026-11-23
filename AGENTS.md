@@ -29,6 +29,8 @@ In Rust tests, `testutil::HeadlessViewer` does all of this: it starts a headless
 
 Never run `seer install` or `seer uninstall` while developing or testing: they change the user's real file associations and `PATH`. Test `install::install` and `install::uninstall` with an `install::Target` pointing at a `registry::TestRoot` (a throwaway key under `HKEY_CURRENT_USER\Software`, deleted on drop) and a temporary directory, as the tests in `src/install.rs` and `tests/install.rs` do.
 
+The one exception is a change ready for the maintainer to approve. When asking them to approve its commit message, first install the branch for them to try: build it with `cargo build --release` and run `target\release\seer.exe install`.
+
 ## Public repository
 
 This repository is public.
