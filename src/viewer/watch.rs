@@ -555,16 +555,19 @@ mod tests {
         );
         assert!(notified.load(Ordering::SeqCst) > 0);
 
+        // A directory stays watched while an image in it is open. Closing the
+        // first image also drops any late report of its write, which the
+        // system may deliver in a later read than the first.
+        watcher.unwatch(ImageId(1));
+        assert!(watcher.is_watching(&two));
+
         std::fs::remove_file(&two).unwrap();
         std::fs::write(&three, b"after").unwrap();
         assert_eq!(
-            wait_for(&mut watcher, |seen| seen.len() == 2),
+            wait_for(&mut watcher, |seen| seen.len() >= 2),
             [ImageId(2), ImageId(3)]
         );
 
-        // A directory stays watched while an image in it is open.
-        watcher.unwatch(ImageId(1));
-        assert!(watcher.is_watching(&two));
         watcher.unwatch(ImageId(2));
         assert!(!watcher.is_watching(&two));
         watcher.unwatch(ImageId(2));
