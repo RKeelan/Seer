@@ -85,8 +85,8 @@ enum Command {
     /// Close the viewer.
     Quit,
     /// Install Seer for the current user: copy seer.exe and seerw.exe to
-    /// %LOCALAPPDATA%\Programs\Seer, add that directory to PATH, and register
-    /// Seer for its image types.
+    /// %LOCALAPPDATA%\Programs\Seer, add that directory to PATH, register
+    /// Seer for its image types, and add it to the Start menu.
     Install,
     /// Undo `seer install`.
     Uninstall,
