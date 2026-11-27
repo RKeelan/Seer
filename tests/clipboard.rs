@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use seer::testutil::{
     Format, HeadlessViewer, Pixels, Rgba, TempDir, VIEWER_TIMEOUT, assert_similar, read_image,
-    write_image,
+    retry, write_image,
 };
 use seer::viewer::clipboard::{SINK_DIB, SINK_PNG};
 
@@ -73,12 +73,13 @@ fn wait_until(done: impl Fn() -> bool) {
 /// DIB. Copies are prepared off the viewer's UI thread, so they land after
 /// `seer debug input` returns; the viewer writes the PNG last.
 fn copied(sink: &TempDir) -> (Pixels, usize) {
-    wait_until(|| sink.join(SINK_PNG).is_file());
-    let png = read_image(&sink.join(SINK_PNG)).expect("a PNG was copied");
-    let dib = std::fs::read(sink.join(SINK_DIB)).expect("a DIB was copied");
-    std::fs::remove_file(sink.join(SINK_PNG)).unwrap();
-    std::fs::remove_file(sink.join(SINK_DIB)).unwrap();
-    (png, dib.len())
+    let (png, dib) = (sink.join(SINK_PNG), sink.join(SINK_DIB));
+    wait_until(|| png.is_file());
+    let pixels = retry(|| read_image(&png)).expect("a PNG was copied");
+    let bytes = retry(|| std::fs::read(&dib)).expect("a DIB was copied");
+    retry(|| std::fs::remove_file(&png)).unwrap();
+    retry(|| std::fs::remove_file(&dib)).unwrap();
+    (pixels, bytes.len())
 }
 
 #[test]

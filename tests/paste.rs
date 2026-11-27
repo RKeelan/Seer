@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use seer::protocol::OpenReply;
 use seer::testutil::{
-    Format, HeadlessViewer, Pixels, Rgba, TempDir, VIEWER_TIMEOUT, read_image, write_image,
+    Format, HeadlessViewer, Pixels, Rgba, TempDir, VIEWER_TIMEOUT, read_image, retry, write_image,
 };
 use seer::viewer::clipboard::{SINK_DIB, SINK_PNG};
 use seer::viewer::paste::{SINK_FILES, SINK_PASTED};
@@ -74,7 +74,7 @@ fn ctrl_v_saves_the_clipboard_image_and_opens_it() {
     assert_eq!(pasted.path.parent(), Some(folder.as_path()), "{pasted:?}");
     let name = pasted.path.file_name().unwrap().to_string_lossy();
     assert!(name.starts_with("pasted-") && name.ends_with(".png"));
-    assert_eq!(read_image(&pasted.path).unwrap(), picture());
+    assert_eq!(retry(|| read_image(&pasted.path)).unwrap(), picture());
 
     // Closing the pasted image deletes its file; the viewer's own files stay.
     input(&viewer, &[CTRL_V]);
@@ -131,14 +131,14 @@ fn seer_paste_converts_a_bitmap_and_answers_with_the_file() {
         assert!(Instant::now() < deadline, "nothing was copied");
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::fs::remove_file(sink.join(SINK_PNG)).unwrap();
+    retry(|| std::fs::remove_file(sink.join(SINK_PNG))).unwrap();
     assert!(sink.join(SINK_DIB).is_file());
 
     let opened: OpenReply = viewer.seer_json(["paste", "--group", "bugs", "--caption", "the menu"]);
     assert!(opened.failed.is_empty());
     let image = &opened.images[0];
     assert!(image.path.starts_with(sink.join(SINK_PASTED)));
-    assert_eq!(read_image(&image.path).unwrap(), picture());
+    assert_eq!(retry(|| read_image(&image.path)).unwrap(), picture());
     let list = viewer.wait_until_loaded(2);
     assert_eq!(list.images[1].group.as_deref(), Some("bugs"));
     assert_eq!(list.images[1].caption.as_deref(), Some("the menu"));
@@ -164,7 +164,7 @@ fn copied_files_open_as_copies() {
     let paths: Vec<_> = opened.images.iter().map(|image| &image.path).collect();
     assert_eq!(paths, [&folder.join("a.png"), &folder.join("b.png")]);
     assert_eq!(
-        read_image(paths[0]).unwrap(),
+        retry(|| read_image(paths[0])).unwrap(),
         Pixels::solid(8, 8, Rgba::RED)
     );
     // Pasted again, the copies get names of their own.
