@@ -533,6 +533,26 @@ pub fn read_image(path: &Path) -> Result<Pixels> {
     })
 }
 
+/// How long [`retry`] keeps trying.
+pub const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Calls `attempt` until it succeeds or [`RETRY_TIMEOUT`] passes, and
+/// returns its last result. Another program, such as a virus scanner, can
+/// hold a file a viewer has just written open for a moment, so reading or
+/// deleting it can fail even though it is whole.
+pub fn retry<T, E>(
+    mut attempt: impl FnMut() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let deadline = Instant::now() + RETRY_TIMEOUT;
+    loop {
+        let result = attempt();
+        if result.is_ok() || Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A directory under the system's temporary directory, removed with its
 /// contents when dropped.
 #[derive(Debug)]
