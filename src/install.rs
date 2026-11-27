@@ -19,6 +19,9 @@
 //! `Software\RegisteredApplications` entry pointing to it. It never makes
 //! Seer the default for any type: Windows asks the user to choose.
 //!
+//! It also writes `Seer.lnk`, a shortcut to `seerw.exe`, to the user's Start
+//! menu programs folder, so that Start search finds Seer.
+//!
 //! Last, it adds an uninstall entry,
 //! `Software\Microsoft\Windows\CurrentVersion\Uninstall\RKeelan.Seer`, so Seer
 //! appears in Settings > Apps > Installed apps, which runs `seer uninstall` to
@@ -30,7 +33,7 @@
 //! same extensions alone.
 //!
 //! Every location is a field of [`Target`], so tests install into a
-//! throwaway registry key and directory.
+//! throwaway registry key and directories.
 
 use std::ffi::OsString;
 use std::fs;
@@ -39,11 +42,18 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    IPersistFile,
+};
+use windows::Win32::UI::Shell::{
+    FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
+    SHChangeNotify, SHGetKnownFolderPath, ShellLink,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
 };
-use windows::core::w;
+use windows::core::{HSTRING, Interface, w};
 
 use crate::error::{Error, Result};
 use crate::registry::{self, Key, Value};
@@ -64,6 +74,9 @@ pub const PACKAGE: &str = "RKeelan.Seer";
 
 /// The publisher the uninstall entry names, as the winget manifest does.
 const PUBLISHER: &str = "RKeelan";
+
+/// The Start menu shortcut's description, which Start shows as its tooltip.
+const SHORTCUT_DESCRIPTION: &str = "Image viewer";
 
 /// A family of formats that shares one ProgID.
 #[derive(Clone, Copy, Debug)]
@@ -150,11 +163,14 @@ pub struct Target {
     /// Where an executable that cannot be deleted because it is running is
     /// moved to instead. It must be on the same volume as `directory`.
     pub trash: PathBuf,
+    /// The Start menu directory the shortcut to the viewer goes in.
+    pub shortcuts: PathBuf,
 }
 
 impl Target {
     /// The real locations for the current user: `HKEY_CURRENT_USER\Software`,
-    /// `HKEY_CURRENT_USER\Environment` and `%LOCALAPPDATA%\Programs\Seer`.
+    /// `HKEY_CURRENT_USER\Environment`, `%LOCALAPPDATA%\Programs\Seer` and the
+    /// user's Start menu programs folder.
     pub fn for_user() -> Result<Target> {
         let local = std::env::var_os("LOCALAPPDATA")
             .filter(|local| !local.is_empty())
@@ -164,7 +180,13 @@ impl Target {
             environment: "Environment".to_owned(),
             directory: PathBuf::from(local).join("Programs").join(APPLICATION),
             trash: std::env::temp_dir(),
+            shortcuts: start_menu_programs()?,
         })
+    }
+
+    /// The Start menu shortcut to the viewer.
+    pub fn shortcut(&self) -> PathBuf {
+        self.shortcuts.join(format!("{APPLICATION}.lnk"))
     }
 
     fn classes(&self) -> String {
@@ -220,12 +242,14 @@ pub struct Uninstalled {
 }
 
 /// Copies the executables from `source` into the target directory, adds it
-/// to `PATH`, and registers the file associations. Installing again replaces
-/// the executables, including running ones, and leaves the rest as it was.
+/// to `PATH`, registers the file associations, and adds the Start menu
+/// shortcut. Installing again replaces the executables, including running
+/// ones, and the shortcut, and leaves the rest as it was.
 pub fn install(target: &Target, source: &Path) -> Result<Installed> {
     copy_executables(source, target)?;
     register(target)?;
     let path_added = edit_path(target, |path| path_with(path, &target.directory))?;
+    create_shortcut(target)?;
     add_uninstall_entry(target)?;
     Ok(Installed {
         directory: target.directory.clone(),
@@ -237,6 +261,7 @@ pub fn install(target: &Target, source: &Path) -> Result<Installed> {
 pub fn uninstall(target: &Target) -> Result<Uninstalled> {
     unregister(target)?;
     let path_removed = edit_path(target, |path| path_without(path, &target.directory))?;
+    remove_shortcut(target)?;
     remove_executables(target)?;
     Ok(Uninstalled {
         directory: target.directory.clone(),
@@ -324,6 +349,61 @@ fn same_file(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
+    }
+}
+
+/// The user's Start menu programs folder.
+fn start_menu_programs() -> Result<PathBuf> {
+    // SAFETY: the folder id is a constant and no access token is given.
+    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None) }?;
+    // SAFETY: the shell returned a valid, null-terminated string.
+    let copied = unsafe { path.to_hstring() };
+    // SAFETY: the shell allocated the string with the COM allocator, and
+    // nothing uses it after this.
+    unsafe { CoTaskMemFree(Some(path.as_ptr().cast_const().cast())) };
+    Ok(PathBuf::from(copied.to_os_string()))
+}
+
+/// Initialises COM on this thread, if it is not already, and creates a shell
+/// link object.
+fn shell_link() -> Result<IShellLinkW> {
+    // SAFETY: initialising COM has no preconditions. It reports S_FALSE or
+    // RPC_E_CHANGED_MODE when COM is already initialised on this thread, and
+    // COM is usable either way, so the result is ignored.
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    // SAFETY: the class id is a constant and no outer object is given.
+    Ok(unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }?)
+}
+
+/// Writes the Start menu shortcut to the viewer, replacing any already there.
+fn create_shortcut(target: &Target) -> Result<()> {
+    fs::create_dir_all(&target.shortcuts)
+        .map_err(|error| file_error("could not create", &target.shortcuts, &error))?;
+    let viewer = HSTRING::from(target.viewer().as_os_str());
+    let directory = HSTRING::from(target.directory.as_os_str());
+    let shortcut = target.shortcut();
+    let link = shell_link()?;
+    // SAFETY: each string outlives the call that reads it.
+    unsafe {
+        link.SetPath(&viewer)?;
+        link.SetWorkingDirectory(&directory)?;
+        link.SetIconLocation(&viewer, 0)?;
+        link.SetDescription(&HSTRING::from(SHORTCUT_DESCRIPTION))?;
+    }
+    let file: IPersistFile = link.cast()?;
+    // SAFETY: the path outlives the call.
+    unsafe { file.Save(&HSTRING::from(shortcut.as_os_str()), true) }.map_err(|error| {
+        Error::unexpected(format!("could not write {}: {error}", shortcut.display()))
+    })
+}
+
+fn remove_shortcut(target: &Target) -> Result<()> {
+    let shortcut = target.shortcut();
+    match fs::remove_file(&shortcut) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(file_error("could not remove", &shortcut, &error))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -516,7 +596,8 @@ fn same_entry(entry: &str, directory: &str) -> bool {
 pub fn describe_installed(installed: &Installed) -> String {
     let directory = installed.directory.display();
     let mut text = format!(
-        "Installed {} to {directory}.\nSeer is now in Open with for its image types; \
+        "Installed {} to {directory}.\nSeer is now in the Start menu, and in Open with for its \
+         image types; \
          to make it the default, choose it in Settings > Apps > Default apps.\n",
         EXECUTABLES.join(" and ")
     );
@@ -531,7 +612,8 @@ pub fn describe_installed(installed: &Installed) -> String {
 /// A short report of an uninstallation, for people.
 pub fn describe_uninstalled(uninstalled: &Uninstalled) -> String {
     let directory = uninstalled.directory.display();
-    let mut text = format!("Removed Seer from {directory} and its file associations.\n");
+    let mut text =
+        format!("Removed Seer from {directory}, the Start menu and its file associations.\n");
     if uninstalled.path_removed {
         text.push_str(&format!("Removed {directory} from your PATH.\n"));
     }
@@ -541,6 +623,10 @@ pub fn describe_uninstalled(uninstalled: &Uninstalled) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::MAX_PATH;
+    use windows::Win32::System::Com::STGM_READ;
+    use windows::Win32::UI::Shell::SLGP_RAWPATH;
+
     use crate::registry::TestRoot;
     use crate::testutil::TempDir;
 
@@ -569,6 +655,7 @@ mod tests {
                 environment: format!(r"{}\Environment", root.path()),
                 directory: files.join(r"Programs\Seer"),
                 trash,
+                shortcuts: files.join(r"Start Menu\Programs"),
             };
             // The real `Software` key always exists, and uninstalling leaves it.
             Key::create(&target.software).unwrap();
@@ -586,6 +673,39 @@ mod tests {
                 source,
             }
         }
+    }
+
+    /// What a shortcut says: its target, icon file and index, and description.
+    /// The shell stores the target's long name even when it was given a short
+    /// one (such as `RUNNER~1` in a CI runner's `TEMP`), so both paths are
+    /// canonicalised to compare them.
+    fn read_shortcut(path: &Path) -> (PathBuf, PathBuf, i32, String) {
+        let link = shell_link().unwrap();
+        let file: IPersistFile = link.cast().unwrap();
+        // SAFETY: the path outlives the call.
+        unsafe { file.Load(&HSTRING::from(path.as_os_str()), STGM_READ) }.unwrap();
+        let text = |buffer: &[u16]| {
+            let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+            String::from_utf16_lossy(&buffer[..end])
+        };
+        let mut target = [0u16; MAX_PATH as usize];
+        let mut icon = [0u16; MAX_PATH as usize];
+        let mut index = 0;
+        let mut description = [0u16; 256];
+        // SAFETY: each buffer outlives the call that fills it, and no find
+        // data is asked for.
+        unsafe {
+            link.GetPath(&mut target, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
+                .unwrap();
+            link.GetIconLocation(&mut icon, &mut index).unwrap();
+            link.GetDescription(&mut description).unwrap();
+        }
+        (
+            fs::canonicalize(text(&target)).unwrap(),
+            fs::canonicalize(text(&icon)).unwrap(),
+            index,
+            text(&description),
+        )
     }
 
     /// Every key and value an installation into `directory` makes, as
@@ -722,11 +842,19 @@ mod tests {
         ));
         expected.sort();
         assert_eq!(sandbox.root.dump(), expected);
+        let viewer = fs::canonicalize(target.directory.join(VIEWER)).unwrap();
+        let shortcut = target.shortcuts.join("Seer.lnk");
+        assert_eq!(target.shortcut(), shortcut);
+        let expected_shortcut = (viewer.clone(), viewer, 0, "Image viewer".to_owned());
+        assert_eq!(read_shortcut(&shortcut), expected_shortcut);
 
-        // Installing again changes nothing, and doesn't add to PATH twice.
+        // Installing again changes nothing, and doesn't add to PATH twice. It
+        // overwrites a shortcut that was changed.
+        fs::write(&shortcut, "not a shortcut").unwrap();
         let again = install(target, &sandbox.source).unwrap();
         assert!(!again.path_added);
         assert_eq!(sandbox.root.dump(), expected);
+        assert_eq!(read_shortcut(&shortcut), expected_shortcut);
 
         let uninstalled = uninstall(target).unwrap();
         assert_eq!(
@@ -739,6 +867,8 @@ mod tests {
         assert_eq!(sandbox.root.dump(), before);
         assert!(!target.directory.exists());
         assert!(target.directory.parent().unwrap().exists());
+        assert!(!shortcut.exists());
+        assert!(target.shortcuts.exists());
 
         // Uninstalling again finds nothing to do.
         let again = uninstall(target).unwrap();
@@ -867,6 +997,28 @@ mod tests {
     }
 
     #[test]
+    fn a_shortcut_that_cannot_be_written_or_removed_is_reported() {
+        let sandbox = Sandbox::new();
+        let blocker = sandbox.files.join("file");
+        fs::write(&blocker, "").unwrap();
+        let target = Target {
+            shortcuts: blocker.join("Programs"),
+            ..sandbox.target.clone()
+        };
+        let error = install(&target, &sandbox.source).unwrap_err();
+        assert!(error.message.contains("could not create"), "{error}");
+
+        // A directory where the shortcut goes can be neither written over
+        // nor removed as a file.
+        let target = &sandbox.target;
+        fs::create_dir_all(target.shortcut()).unwrap();
+        let error = install(target, &sandbox.source).unwrap_err();
+        assert!(error.message.contains("could not write"), "{error}");
+        let error = uninstall(target).unwrap_err();
+        assert!(error.message.contains("could not remove"), "{error}");
+    }
+
+    #[test]
     fn a_file_that_will_not_go_is_reported() {
         let dir = TempDir::new().unwrap();
         // A directory cannot be removed as a file, nor moved into a trash
@@ -906,6 +1058,8 @@ mod tests {
         assert_eq!(target.software, "Software");
         assert_eq!(target.environment, "Environment");
         assert!(target.directory.ends_with(r"Programs\Seer"));
+        assert!(target.shortcuts.ends_with(r"Start Menu\Programs"));
+        assert!(target.shortcuts.is_absolute());
     }
 
     #[test]

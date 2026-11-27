@@ -39,11 +39,13 @@ fn a_running_viewer_is_replaced_and_removed() {
         environment: format!(r"{}\Environment", root.path()),
         directory: files.join(r"Programs\Seer"),
         trash: trash.clone(),
+        shortcuts: files.join(r"Start Menu\Programs"),
     };
     let source = Path::new(env!("CARGO_BIN_EXE_seerw")).parent().unwrap();
     assert!(source.join(EXECUTABLES[0]).is_file());
 
     install::install(&target, source).unwrap();
+    assert!(target.shortcut().is_file());
     // The running viewer can't be overwritten, so it is moved aside.
     while_running(&target, || {
         install::install(&target, source).unwrap();
@@ -54,4 +56,5 @@ fn a_running_viewer_is_replaced_and_removed() {
     });
     assert_eq!(fs::read_dir(&trash).unwrap().count(), 2);
     assert!(!target.directory.exists());
+    assert!(!target.shortcut().exists());
 }
